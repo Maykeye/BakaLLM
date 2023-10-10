@@ -1,0 +1,17 @@
+This branch contains previous iteration of BakaNet(working title) that I described in my devto blog, but never released.
+It's still technically more "half of source available" as scripts like maykio and maykds responspible for bunch of utils
+are not present.
+In particular, iterator differs from `pristine` that it injected BOS every batch.
+This behavior is too much similar to attention sink, therefore it was removed from `pristine` branch which is a new baseline.
+This branch also contains scripts that was used to cleanup wikitext103 in pre-pristine era.
+Now instead of cleaned  https://huggingface.co/datasets/wikitext (more specifically https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-raw-v1.zip") iohadrubin/wikitext-103-raw-v1 is used
+
+@misc{merity2016pointer,
+      title={Pointer Sentinel Mixture Models},
+      author={Stephen Merity and Caiming Xiong and James Bradbury and Richard Socher},
+      year={2016},
+      eprint={1609.07843},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL}
+}
+
