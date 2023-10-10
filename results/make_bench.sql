@@ -1,0 +1,23 @@
+
+CREATE TABLE IF NOT EXISTS Result(
+	id BLOB(16) NOT NULL PRIMARY KEY,
+	config_id NVARCHAR(32) NOT NULL,
+	model_type NVARCHAR(32) NOT NULL,
+	n_params BIGINT NOT NULL,
+	n_input_emb_params BIGINT NOT NULL,
+	benchmark NVARCHAR(32) NOT NULL,
+	benchmark_split NVARCHAR(16) NOT NULL,
+	n_ctx INTEGER NOT NULL,
+	nans INTEGER NOT NULL,
+	loss REAL NOT NULL,
+	ppl REAL NOT NULL,
+	model_architecture_id GUID BLOB(16) NULL,
+	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+CREATE TABLE IF NOT EXISTS ModelArchitecture(
+	id GUID BLOB(16) NOT NULL PRIMARY KEY,
+	hash INTEGER NOT NULL,
+	architecture TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS ModelArchitecture_hash ON ModelArchitecture(hash);

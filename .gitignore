@@ -1,0 +1,12 @@
+__pycache__
+results/
+.vscode
+*.bak
+test/
+targets/
+weights/
+*.bin
+*.stat
+*.scratch.py
+wandb/
+*.log
