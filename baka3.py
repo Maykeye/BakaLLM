@@ -259,16 +259,6 @@ def gen_model_path(project, model):
     return model_path
 
 
-def limit_grad_(model: BakaNetCausalLM):
-    model.requires_grad_(False)
-    for layer in model.model.layers:
-        layer: BakaLayer
-        layer.mlp.requires_grad_(True)
-        layer.norm_in.requires_grad_(True)
-    model.norm_out.requires_grad_(True)
-    print("*** Gradient flow was limited")
-
-
 def main():
     parser = optparse.OptionParser()
     parser.add_option("-p", "--project", dest="project",
@@ -304,7 +294,6 @@ def main():
     if do_load:
         try_load(model, model_path)
         try_load(opt, opt_path)
-    # limit_grad_(model)
 
     for i_batch, batch in enumerate(bar := tqdm(dl)):
         # TODO: once memory instlaled - either increase stride to n_ctx or don't use memory across mini-batches
