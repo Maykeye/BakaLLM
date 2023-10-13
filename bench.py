@@ -169,7 +169,7 @@ def main():
         "mistral-7b": partial(impl_load_transformers, "Mistral-7B-v0.1", dtype=torch.bfloat16, n_ctx=1024),
         ####
         "baka-pythia-160m": load_baka_pythia,
-        "baka-pristine": partial(load_bakanet, "pristine"),
+        "baka-elephant": partial(load_bakanet, "elephant"),
     }
     if not options.model:
         print(f"Use the following loaders: {list(loaders.keys())}")

@@ -32,8 +32,6 @@ class BakaState:
     past_predcessor_state: Optional["BakaState"] = None  # if this is layer L at current chunk C,  this field points to layer (L-1) in chunk (C-1)
 
 
-
-
 @dataclass
 class BakaConfig:
     dim_model: int = 1024
@@ -43,8 +41,8 @@ class BakaConfig:
     n_heads: int = 4
     n_vocab: int = 32000
     n_ctx: int = 512
-    act_fn: str = "silu"
-    model_type="baka_pristine"
+    act_fn: str = "elephant"
+    model_type = "baka_elephant"
 
     def __post_init__(self):
         self.dim_ff = self.dim_ff or self.dim_model * 4
@@ -56,11 +54,33 @@ class BakaConfig:
         return self.dim_attn // self.n_heads
 
 
+class BakaElephant(nn.Module):
+    def __init__(self, d=8.0, a=1.0) -> None:
+        super().__init__()
+        self.d = d
+        self.a = a
+
+    def forward(self, state):
+        state = 1 / (1 + (state / self.a).abs()**self.d)
+        return state
+
+
+BAKA_ACTS = {
+    "elephant": BakaElephant
+}
+
+
+def make_activation_fn(s):
+    if act := BAKA_ACTS.get(s):
+        return act()
+    return ACT2FN[s]
+
+
 class BakaMLP(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
-        self.act = ACT2FN[self.config.act_fn]
+        self.act = make_activation_fn(self.config.act_fn)
         self.fc_gate = nn.Linear(config.dim_model, config.dim_ff, False)
         self.fc_up = nn.Linear(config.dim_model, config.dim_ff, False)
         self.fc_down = nn.Linear(config.dim_ff, config.dim_model, False)
@@ -134,7 +154,6 @@ class BakaNet(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList([BakaLayer(config) for _ in range(config.n_layers)])
-
 
     def forward(self, input: Tensor):
         n_batch, n_seq, n_dim = input.shape
@@ -240,6 +259,16 @@ def gen_model_path(project, model):
     return model_path
 
 
+def limit_grad_(model: BakaNetCausalLM):
+    model.requires_grad_(False)
+    for layer in model.model.layers:
+        layer: BakaLayer
+        layer.mlp.requires_grad_(True)
+        layer.norm_in.requires_grad_(True)
+    model.norm_out.requires_grad_(True)
+    print("*** Gradient flow was limited")
+
+
 def main():
     parser = optparse.OptionParser()
     parser.add_option("-p", "--project", dest="project",
@@ -275,6 +304,7 @@ def main():
     if do_load:
         try_load(model, model_path)
         try_load(opt, opt_path)
+    # limit_grad_(model)
 
     for i_batch, batch in enumerate(bar := tqdm(dl)):
         # TODO: once memory instlaled - either increase stride to n_ctx or don't use memory across mini-batches
