@@ -28,8 +28,18 @@ class BakaState:
     """ Normalized state of the layer """
     input: Optional[Tensor] = None
     output: Optional[Tensor] = None
-    offset = 0
-    past_predcessor_state: Optional["BakaState"] = None  # if this is layer L at current chunk C,  this field points to layer (L-1) in chunk (C-1)
+    offset: int = 0
+    past_predcessor_state: Optional["BakaState"] = None  # if this is layer L at current chunk C, this field points to layer (L-1) in chunk (C-1)
+    k_cache: Optional[Tensor] = None
+    v_cache: Optional[Tensor] = None
+
+    @property
+    def n_seq(self):
+        return self.input.shape[1]
+
+    @property
+    def device(self):
+        return self.input.device
 
 
 @dataclass
@@ -42,7 +52,7 @@ class BakaConfig:
     n_vocab: int = 32000
     n_ctx: int = 512
     act_fn: str = "elephant"
-    model_type = "baka_elephant"
+    model_type = "baka_xl"
 
     def __post_init__(self):
         self.dim_ff = self.dim_ff or self.dim_model * 4
@@ -111,8 +121,24 @@ class BakaAttention(nn.Module):
         return y
 
     def build_attn_mask(self, state: BakaState):
-        del state
-        return True, None
+        # Will not be required in future versions of pytorch, hopefully.
+        # See https://github.com/pytorch/pytorch/issues/108108
+        if state.past_predcessor_state is None:
+            return True, None
+        now_n_seq = state.n_seq
+        past_n_seq = state.past_predcessor_state.n_seq
+
+        # Build a matrix for both past and present
+        # 1 1 1 1  1 1 1
+        # 1 1 1 1  1 1 1
+        # 1 1 1 1  1 1 1
+        mask = torch.ones(now_n_seq, now_n_seq + past_n_seq, dtype=torch.bool, device=state.device)
+        # by shifting diagonal we can cut from current chunk only
+        mask = mask.tril_(past_n_seq)
+        # 1 1 1 1  1 0 0
+        # 1 1 1 1  1 1 0
+        # 1 1 1 1  1 1 1
+        return False, mask
 
     def build_qkv(self, state: BakaState):
         # project
@@ -127,6 +153,18 @@ class BakaAttention(nn.Module):
         # pos embeds
         q = self.rot.rotate_queries_or_keys(q, -2, offset=state.offset)
         k = self.rot.rotate_queries_or_keys(k, -2, offset=state.offset)
+
+        state.k_cache = k
+        state.v_cache = v
+
+        # restore the past
+        if state.past_predcessor_state:
+            past_k = state.past_predcessor_state.k_cache
+            past_v = state.past_predcessor_state.v_cache
+            assert past_k is not None and past_v is not None
+            k = torch.cat((past_k, k), -2)
+            v = torch.cat((past_v, v), -2)
+
         return q, k, v
 
 
@@ -161,9 +199,8 @@ class BakaNet(nn.Module):
         del n_dim
         old_states = [None for _ in range(self.config.n_layers)]
         outputs = []
-        # FIXME: offset is not being used
         for pos in range(0, n_seq, self.config.n_ctx):
-            states = [BakaState(input=None) for _ in range(self.config.n_layers)]
+            states = [BakaState(input=None, offset=pos) for _ in range(self.config.n_layers)]
             states[0].input = input[:, pos:pos+self.config.n_ctx, :]
             for i, layer in enumerate(self.layers):
                 states[i].past_predcessor_state = old_states[i-1] if i else None
@@ -279,7 +316,7 @@ def main():
     assert project, "project name is required"
     assert run_id, "run id is required"
     tokenizer = get_tokenizer()
-    dl = get_dl(tokenizer, batch_size=6)
+    dl = get_dl(tokenizer, batch_size=5)
     clip = 1.0
     #
     model = make_model(tokenizer)
@@ -299,7 +336,7 @@ def main():
         # TODO: once memory instlaled - either increase stride to n_ctx or don't use memory across mini-batches
         for mb in batch_iterator(batch,
                                  n_ctx=training_ctx_size,
-                                 n_stride=training_ctx_size // 2,
+                                 n_stride=training_ctx_size//2,
                                  tokenizer=tokenizer):
             out = model(input_ids=mb.input_ids, labels=mb.labels)
             loss = out.loss

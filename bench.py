@@ -129,6 +129,7 @@ def record(ctx: TestContext, loss, nans):
     n_input_emb_params = sum(p.numel() for p in main_model.get_input_embeddings().parameters())
     benchmark = "wikipedia103"
     benchmark_split = "valid"
+    note = ctx.note
     with con as cursor:
         model_architecture_id = write_hashed_text(cursor, "ModelArchitecture", "architecture", str(model))
 
@@ -136,13 +137,13 @@ def record(ctx: TestContext, loss, nans):
                        n_params, n_input_emb_params, 
                        benchmark, benchmark_split,
                        nans, n_ctx, loss, ppl,
-                       model_architecture_id) 
-    VALUES (?,?,?,  ?,?,  ?,?, ?,?,?,?, ?)""", (
+                       model_architecture_id, note) 
+    VALUES (?,?,?,  ?,?,  ?,?, ?,?,?,?, ?,?)""", (
             record_id, config_id, model.config.model_type,
             n_param, n_input_emb_params,
             benchmark, benchmark_split,
             nans, n_ctx, loss, math.exp(loss),
-            model_architecture_id))
+            model_architecture_id, note))
 
         con.commit()
     return record_id
@@ -153,6 +154,7 @@ def main():
     parser = optparse.OptionParser()
     parser.add_option("-m", "--model", dest="model", help="load model")
     parser.add_option("-n", "--n_ctx", dest="n_ctx", type="int", help="context size")
+    parser.add_option("-t", "--textnote", dest="note", help="note to myself")
     options, _ = parser.parse_args()
 
     loaders = {
@@ -169,7 +171,7 @@ def main():
         "mistral-7b": partial(impl_load_transformers, "Mistral-7B-v0.1", dtype=torch.bfloat16, n_ctx=1024),
         ####
         "baka-pythia-160m": load_baka_pythia,
-        "baka-elephant": partial(load_bakanet, "elephant"),
+        "baka-xl": partial(load_bakanet, "baka-xl"),
     }
     if not options.model:
         print(f"Use the following loaders: {list(loaders.keys())}")
@@ -179,6 +181,7 @@ def main():
 
     ctx = loaders[options.model]()
     ctx.config_id = options.model
+    ctx.note = options.note
     if options.n_ctx:
         ctx.n_ctx = options.n_ctx
     print("Loaded")
