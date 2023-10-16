@@ -150,21 +150,24 @@ class BakaAttention(nn.Module):
         k = rearrange(k, "b t (h f) -> b h t f", h=self.config.n_heads)
         v = rearrange(v, "b t (h f) -> b h t f", h=self.config.n_heads)
 
-        # pos embeds
-        q = self.rot.rotate_queries_or_keys(q, -2, offset=state.offset)
-        k = self.rot.rotate_queries_or_keys(k, -2, offset=state.offset)
-
+        # Cache keys without rotating
         state.k_cache = k
         state.v_cache = v
 
-        # restore the past
+        # restore the past and rotate it with the current
+        n_past_seq = 0
         if state.past_predcessor_state:
             past_k = state.past_predcessor_state.k_cache
+            n_past_seq = state.past_predcessor_state.n_seq
             past_v = state.past_predcessor_state.v_cache
             assert past_k is not None and past_v is not None
             k = torch.cat((past_k, k), -2)
             v = torch.cat((past_v, v), -2)
 
+        # pos embeds
+        # query is shifted into the future by the history size
+        q = self.rot.rotate_queries_or_keys(q, -2, offset=n_past_seq)
+        k = self.rot.rotate_queries_or_keys(k, -2, offset=0)
         return q, k, v
 
 
