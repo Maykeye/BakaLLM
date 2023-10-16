@@ -74,16 +74,33 @@ def batch_iterator(
         batch,
         n_ctx,
         n_stride,
+        n_skip_first=0,
         device="cuda",
         tokenizer: Optional[AutoTokenizer] = None,
         cut_empty=True
 ) -> Iterable[MiniBatch]:
+    """Split the bigger batch into batches small enough
+
+    Args:
+        batch (torch.Tensor): the original batch(e.g. wikitext articles)
+        n_ctx (_type_): context size of the minibatch
+        n_stride (_type_): stride (step)
+        n_skip_first (int, optional): Skip first N tokens from the global batch. Defaults to 0.
+        device (str, optional): Pass each mini-batch to this device. Defaults to "cuda".
+        tokenizer (Optional[AutoTokenizer], optional): Tokenizer for decided which empty batches to discard. Defaults to None.
+        cut_empty (bool, optional): Flag that sets if empty batches(batches that contain padding only) should be discarded and not returned to the caller. Defaults to True.
+
+    Yields:
+        Iterator[MiniBatch]: Mini-batch
+    """
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
     labels = batch["labels"]
+    if n_skip_first:
+        input_ids = input_ids[:, n_skip_first:]
+        attention_mask = attention_mask[:, n_skip_first:]
+        labels = labels[:, n_skip_first:]
     assert tokenizer.padding_side == 'right'
-    i = 0
-    bos = tokenizer.bos_token_id
     last_mask = None
     mb_select_mask = None
     seq_total = input_ids.shape[-1]
