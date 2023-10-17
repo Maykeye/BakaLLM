@@ -157,16 +157,16 @@ class BakaAttention(nn.Module):
         # restore the past and rotate it with the current
         n_past_seq = 0
         if state.past_predcessor_state:
-            past_k = state.past_predcessor_state.k_cache
             n_past_seq = state.past_predcessor_state.n_seq
+            past_k = state.past_predcessor_state.k_cache
             past_v = state.past_predcessor_state.v_cache
             assert past_k is not None and past_v is not None
             k = torch.cat((past_k, k), -2)
             v = torch.cat((past_v, v), -2)
 
         # pos embeds
-        # query is shifted into the future by the history size
-        q = self.rot.rotate_queries_or_keys(q, -2, offset=n_past_seq)
+        # query is not shifted into the future by the history size
+        q = self.rot.rotate_queries_or_keys(q, -2, offset=0)
         k = self.rot.rotate_queries_or_keys(k, -2, offset=0)
         return q, k, v
 
