@@ -12,11 +12,12 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from dataclasses import dataclass
+import dataclasses
 from typing import Optional
 
 from rotary_embedding_torch import RotaryEmbedding
 import mmh3
-from bakadata import get_dl, get_tokenizer, batch_iterator
+from bakadata import get_dl, get_tokenizer, batch_iterator, MiniBatch
 
 
 def model_numel(m: nn.Module):
@@ -51,6 +52,8 @@ class BakaConfig:
     n_heads: int = 4
     n_vocab: int = 32000
     n_ctx: int = 512
+    n_history_rewind: int = 256*256*256  # Arbitrary large number to disable rewinding (Position rewinding NYI)
+
     act_fn: str = "elephant"
     model_type = "baka_xl"
 
@@ -150,24 +153,23 @@ class BakaAttention(nn.Module):
         k = rearrange(k, "b t (h f) -> b h t f", h=self.config.n_heads)
         v = rearrange(v, "b t (h f) -> b h t f", h=self.config.n_heads)
 
-        # Cache keys without rotating
+        # Cache keys without rotating (temporary?)
         state.k_cache = k
         state.v_cache = v
 
+        # pos embeds
+        # both query and keys are shifted into the future by state offset
+        q = self.rot.rotate_queries_or_keys(q, -2, offset=state.offset)
+        k = self.rot.rotate_queries_or_keys(k, -2, offset=state.offset)
+
         # restore the past and rotate it with the current
-        n_past_seq = 0
-        if state.past_predcessor_state:
-            n_past_seq = state.past_predcessor_state.n_seq
-            past_k = state.past_predcessor_state.k_cache
-            past_v = state.past_predcessor_state.v_cache
+        if (past := state.past_predcessor_state):
+            past_k = self.rot.rotate_queries_or_keys(past.k_cache, -2, offset=past.offset)
+            past_v = past.v_cache
             assert past_k is not None and past_v is not None
             k = torch.cat((past_k, k), -2)
             v = torch.cat((past_v, v), -2)
 
-        # pos embeds
-        # query is not shifted into the future by the history size
-        q = self.rot.rotate_queries_or_keys(q, -2, offset=0)
-        k = self.rot.rotate_queries_or_keys(k, -2, offset=0)
         return q, k, v
 
 
@@ -196,21 +198,50 @@ class BakaNet(nn.Module):
         self.config = config
         self.layers = nn.ModuleList([BakaLayer(config) for _ in range(config.n_layers)])
 
-    def forward(self, input: Tensor):
+    def forward(self, input: Tensor, old_states: Optional[list[BakaState]] = None) -> Tuple[Tensor, list[BakaState]]:
+        # TODO output_states flag
+
         n_batch, n_seq, n_dim = input.shape
+        # Del unused vars to calm down my editor's LSP
         del n_batch
         del n_dim
-        old_states = [None for _ in range(self.config.n_layers)]
+
+        # Prepare placeholder for past state if nothing was provided
+        if old_states is None:
+            old_states = [None for _ in range(self.config.n_layers)]
+
+        # Calculate the start position from the start position and length of the last chunk (if any)
+        start_pos = 0
+        if old_states[0]:
+            start_pos = old_states[0].offset + old_states[0].n_seq
+
+        # Prepare outputs for each chunk
         outputs = []
+
+        # Move in context left to right
         for pos in range(0, n_seq, self.config.n_ctx):
-            states = [BakaState(input=None, offset=pos) for _ in range(self.config.n_layers)]
+            # Prepare this step state
+            states = [BakaState(input=None, offset=start_pos + pos) for _ in range(self.config.n_layers)]
+
+            # pass input from the current context window
             states[0].input = input[:, pos:pos+self.config.n_ctx, :]
+
+            # Move in the model top to bottom
             for i, layer in enumerate(self.layers):
+                # Link current state to the past state
                 states[i].past_predcessor_state = old_states[i-1] if i else None
+
+                # Link output of the intermediate layer to input of the next intermediate layer
                 if i:
                     states[i].input = states[i-1].output
+
+                # Let the layer cook current state
                 layer(states[i])
+
+            # Last layer represents everything we know so far
             outputs.append(states[-1].output)
+
+            # Shift current states into old states
             old_states = states
 
             # Detach older states
@@ -218,13 +249,14 @@ class BakaNet(nn.Module):
                 state.past_predcessor_state = None
 
         outputs = torch.cat(outputs, 1)
-        return outputs
+        return outputs, old_states
 
 
 @dataclass
 class BakaCausalLMOutput:
     logits: Tensor
     loss: Optional[Tensor] = None
+    states: Optional[BakaState] = None
 
 
 class BakaNetCausalLM(nn.Module):
@@ -239,9 +271,14 @@ class BakaNetCausalLM(nn.Module):
         # HF compatibility hack
         self.model.get_input_embeddings = lambda: self.vocab_in
 
-    def forward(self, input_ids: LongTensor, labels: Optional[LongTensor] = None, attention_mask="ignored"):
+    def forward(self,
+                input_ids: LongTensor,
+                labels: Optional[LongTensor] = None,
+                attention_mask="ignored",
+                old_states: Optional[list[BakaState]] = None
+                ):
         y = self.vocab_in(input_ids)
-        y = self.model(y)
+        y, states = self.model(y, old_states)
         y = self.norm_out(y)
         y = self.vocab_out(y)
         loss = None
@@ -249,7 +286,7 @@ class BakaNetCausalLM(nn.Module):
             y_pred = rearrange(y[:, :-1, :], 'b t f -> (b t) f')
             y_true = rearrange(labels[:, 1:], 'b t -> (b t)')
             loss = F.cross_entropy(y_pred, y_true)
-        return BakaCausalLMOutput(loss=loss, logits=y)
+        return BakaCausalLMOutput(loss=loss, logits=y, states=states)
 
 
 WANDB_INITED = False
@@ -299,6 +336,37 @@ def gen_model_path(project, model):
     return model_path
 
 
+def propogate_past_states(past: list[BakaState], mb: MiniBatch):
+    if not past:
+        return
+    keys = list(dataclasses.asdict(BakaState()).keys())
+
+    for state in past:
+        if not state:
+            continue
+        for k in keys:
+            v = getattr(state, k)
+            if not isinstance(v, torch.Tensor):
+                continue
+            v = mb.pass_batch_from_past_to_present(v)
+            setattr(state, k, v)
+
+
+def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=0, write_log=None):
+    past = None
+    for mb in batch_iterator(batch, n_ctx=training_ctx_size, n_stride=training_ctx_size, tokenizer=tokenizer, n_skip_first=n_skip_first):
+        past = propogate_past_states(past, mb)
+        out = model(input_ids=mb.input_ids, labels=mb.labels, old_states=past)
+        past = out.states
+        loss = out.loss
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        opt.step()
+        opt.zero_grad()
+        if write_log:
+            write_log(loss, mb)
+
+
 def main():
     parser = optparse.OptionParser()
     parser.add_option("-p", "--project", dest="project",
@@ -309,12 +377,16 @@ def main():
                       help="enable WANDB log")
     parser.add_option("-l", "--load", dest="do_load", action="store_true",
                       help="load existing model")
+    parser.add_option("-S", "--no-save", dest="do_save", action="store_false", default=True,
+                      help="save the progress(true if load is set)")
     options, _ = parser.parse_args()
 
     project: str = options.project
     run_id: str = options.run_id
+    assert run_id and run_id[-1].isdigit()
     do_log = options.do_log
     do_load = options.do_load
+    do_save = options.do_save or do_load
 
     assert project, "project name is required"
     assert run_id, "run id is required"
@@ -335,26 +407,22 @@ def main():
         try_load(model, model_path)
         try_load(opt, opt_path)
 
+    def write_log(loss: Tensor, mb: MiniBatch):
+        bar.set_description(f'L:{loss.item():.4f}, P:{mb.progress:%}x{mb.n_batch} (len:{mb.seqtotal})')
+        if do_log:
+            wandb_log(loss=loss.item(), project=f"baka3-{project}", run_id=run_id)
+
     for i_batch, batch in enumerate(bar := tqdm(dl)):
-        # TODO: once memory instlaled - either increase stride to n_ctx or don't use memory across mini-batches
-        for mb in batch_iterator(batch,
-                                 n_ctx=training_ctx_size,
-                                 n_stride=training_ctx_size//2,
-                                 tokenizer=tokenizer):
-            out = model(input_ids=mb.input_ids, labels=mb.labels)
-            loss = out.loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-            opt.step()
-            opt.zero_grad()
-            bar.set_description(f'L:{loss.item():.4f}, P:{mb.progress:%}x{mb.n_batch} (len:{mb.seqtotal})')
-            if do_log:
-                wandb_log(loss=loss.item(), project=f"baka3-{project}", run_id=run_id)
-        if i_batch and i_batch % 50 == 0:
+        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, write_log=write_log)
+        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=training_ctx_size//2, write_log=write_log)
+
+        if do_save and i_batch and i_batch % 50 == 0:
             torch.save(model.state_dict(), model_path)
             torch.save(opt.state_dict(), opt_path)
-    torch.save(model.state_dict(), model_path)
-    torch.save(opt.state_dict(), opt_path)
+
+    if do_save:
+        torch.save(model.state_dict(), model_path)
+        torch.save(opt.state_dict(), opt_path)
     print("DONE")
 
 
