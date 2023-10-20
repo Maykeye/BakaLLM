@@ -66,6 +66,9 @@ class BakaConfig:
     def dim_head(self):
         return self.dim_attn // self.n_heads
 
+    # EXPERIMENTAL
+    attn_base_pos: int = 2048
+
 
 class BakaElephant(nn.Module):
     def __init__(self, d=8.0, a=1.0) -> None:
@@ -115,6 +118,8 @@ class BakaAttention(nn.Module):
         self.o = nn.Linear(config.dim_model, config.dim_model, False)
         self.rot = RotaryEmbedding(config.dim_head, use_xpos=False)
 
+        self.base_position = config.attn_base_pos
+
     def forward(self, state: BakaState):
         q, k, v = self.build_qkv(state)
         is_causal, attn_mask = self.build_attn_mask(state)
@@ -159,12 +164,13 @@ class BakaAttention(nn.Module):
 
         # pos embeds
         # both query and keys are shifted into the future by state offset
-        q = self.rot.rotate_queries_or_keys(q, -2, offset=state.offset)
-        k = self.rot.rotate_queries_or_keys(k, -2, offset=state.offset)
+        q = self.rot.rotate_queries_or_keys(q, -2, offset=self.base_position)
+        k = self.rot.rotate_queries_or_keys(k, -2, offset=self.base_position)
 
         # restore the past and rotate it with the current
         if (past := state.past_predcessor_state):
-            past_k = self.rot.rotate_queries_or_keys(past.k_cache, -2, offset=past.offset)
+            n_past_seq = state.past_predcessor_state.n_seq
+            past_k = self.rot.rotate_queries_or_keys(past.k_cache, -2, offset=self.base_position - n_past_seq)
             past_v = past.v_cache
             assert past_k is not None and past_v is not None
             k = torch.cat((past_k, k), -2)
@@ -378,7 +384,7 @@ def main():
     parser.add_option("-l", "--load", dest="do_load", action="store_true",
                       help="load existing model")
     parser.add_option("-S", "--no-save", dest="do_save", action="store_false", default=True,
-                      help="save the progress(true if load is set)")
+                      help="do not save the progress(default: save)")
     options, _ = parser.parse_args()
 
     project: str = options.project
