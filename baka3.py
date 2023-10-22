@@ -1,3 +1,4 @@
+import sys
 import optparse
 from tqdm.auto import tqdm
 import wandb
@@ -385,7 +386,13 @@ def main():
                       help="load existing model")
     parser.add_option("-S", "--no-save", dest="do_save", action="store_false", default=True,
                       help="do not save the progress(default: save)")
-    options, _ = parser.parse_args()
+
+    debug_args = None
+    if sys.gettrace():
+        print("Debug mode")
+        debug_args = ["--project", "debug", "--run", "debug-01", "-S"]
+
+    options, _ = parser.parse_args(debug_args)
 
     project: str = options.project
     run_id: str = options.run_id

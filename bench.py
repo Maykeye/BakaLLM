@@ -52,10 +52,10 @@ def impl_load_transformers(model_id, dtype=torch.float, n_ctx=2048, trust_remote
     return TestContext(model=model, main_model=base_model, tokenizer=tokenizer, n_ctx=n_ctx)
 
 
-def load_bakanet(project, n_ctx=1024*1024):
+def load_bakanet(project, n_ctx=1024*1024, forced_path=None):
     tokenizer = get_tokenizer()
     model = baka3.make_model(tokenizer)
-    state_dict_path = baka3.gen_model_path(project, model)
+    state_dict_path = forced_path or baka3.gen_model_path(project, model)
     print(f"loading {state_dict_path}")
     assert Path(state_dict_path).exists(), f"path not found {state_dict_path}"
     state_dict = torch.load(state_dict_path)
@@ -153,6 +153,7 @@ def main():
     print("Loading the model")
     parser = optparse.OptionParser()
     parser.add_option("-m", "--model", dest="model", help="load model")
+    parser.add_option("-p", "--model-path", dest="model_path", help="force to load bakanet state_dict from the given file")
     parser.add_option("-n", "--n_ctx", dest="n_ctx", type="int", help="context size")
     parser.add_option("-t", "--textnote", dest="note", help="note to myself")
     options, _ = parser.parse_args()
@@ -171,7 +172,7 @@ def main():
         "mistral-7b": partial(impl_load_transformers, "Mistral-7B-v0.1", dtype=torch.bfloat16, n_ctx=1024),
         ####
         "baka-pythia-160m": load_baka_pythia,
-        "baka-xl": partial(load_bakanet, "baka-xl"),
+        "baka-xl": partial(load_bakanet, "baka-xl", forced_path=options.model_path),
     }
     if not options.model:
         print(f"Use the following loaders: {list(loaders.keys())}")
