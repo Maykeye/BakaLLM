@@ -34,6 +34,7 @@ class BakaState:
     past_predcessor_state: Optional["BakaState"] = None  # if this is layer L at current chunk C, this field points to layer (L-1) in chunk (C-1)
     k_cache: Optional[Tensor] = None
     v_cache: Optional[Tensor] = None
+    attn_flip_state: bool = False
 
     @property
     def n_seq(self):
@@ -117,7 +118,8 @@ class BakaAttention(nn.Module):
         self.k = nn.Linear(config.dim_model, config.dim_attn, False)
         self.v = nn.Linear(config.dim_model, config.dim_model, False)
         self.o = nn.Linear(config.dim_model, config.dim_model, False)
-        self.rot = RotaryEmbedding(config.dim_head, use_xpos=False)
+        self.rot = RotaryEmbedding(config.dim_head, use_xpos=False, theta=1000)
+        self.theta = 1000
 
         self.base_position = config.attn_base_pos
 
@@ -163,15 +165,20 @@ class BakaAttention(nn.Module):
         state.k_cache = k
         state.v_cache = v
 
+        current_offset = 0
+        past_offset = self.theta // 2
+        if state.attn_flip_state:
+            current_offset, past_offset = past_offset, current_offset
+
         # pos embeds
         # both query and keys are shifted into the future by state offset
-        q = self.rot.rotate_queries_or_keys(q, -2, offset=self.base_position)
-        k = self.rot.rotate_queries_or_keys(k, -2, offset=self.base_position)
+        q = self.rot.rotate_queries_or_keys(q, -2, offset=current_offset)
+        k = self.rot.rotate_queries_or_keys(k, -2, offset=current_offset)
 
         # restore the past and rotate it with the current
         if (past := state.past_predcessor_state):
             n_past_seq = state.past_predcessor_state.n_seq
-            past_k = self.rot.rotate_queries_or_keys(past.k_cache, -2, offset=self.base_position - n_past_seq)
+            past_k = self.rot.rotate_queries_or_keys(past.k_cache, -2, offset=past_offset)
             past_v = past.v_cache
             assert past_k is not None and past_v is not None
             k = torch.cat((past_k, k), -2)
@@ -225,10 +232,12 @@ class BakaNet(nn.Module):
         # Prepare outputs for each chunk
         outputs = []
 
+        flip_flop = False
+
         # Move in context left to right
         for pos in range(0, n_seq, self.config.n_ctx):
             # Prepare this step state
-            states = [BakaState(input=None, offset=start_pos + pos) for _ in range(self.config.n_layers)]
+            states = [BakaState(input=None, offset=start_pos + pos, attn_flip_state=flip_flop) for _ in range(self.config.n_layers)]
 
             # pass input from the current context window
             states[0].input = input[:, pos:pos+self.config.n_ctx, :]
@@ -254,6 +263,7 @@ class BakaNet(nn.Module):
             # Detach older states
             for state in old_states:
                 state.past_predcessor_state = None
+            flip_flop = not flip_flop
 
         outputs = torch.cat(outputs, 1)
         return outputs, old_states

@@ -32,8 +32,31 @@ But old states are passed within minibatch
 DNF: OoM after 100 minutes due to memory spike
 
 Experiment 5: Long/no-reset
+Good: 4.14817714691162 after 3 epochs
 
+Experiment 6: Long/flip-flip/5k
 
+Consider sequence splitted to windows 
+aaaa bbbb cccc dddd
+Rotation is done like this:
+
+window: aaaa bbbb cccc dddd
+offset: 0000 5000 0000 5000
+
+aaa is rotated to be at 0th offset
+bbb is rotated to be at 5000th offset, historical aaa is still at 0.
+ccc is rotated to be at 0th offset. historical bbb is still at 5000
+ddd is rotated to 5000 offset, past ccc is still rotated at 0th offset.
+
+Hypothesis of why reset doesn't work:
+model learns that token is located at N-th position. If the position changed, model experiences shock.
+If offset is ever-increasing, model learns every offset eventually.
+
+Here comes flip-flop:
+model will learn that window at 0000 for the past looks at position 5000. 
+at the same time, model will learn that sequence at position 5000 looks at position 0000, completing the circle.
+
+It can learn to some trobules in memory retrival phase, but that's a trouble for later and can be solved by using solidifier layer/etc
 
 ## Training
 TODO: training schedule
