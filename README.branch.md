@@ -58,6 +58,20 @@ at the same time, model will learn that sequence at position 5000 looks at posit
 
 It can learn to some trobules in memory retrival phase, but that's a trouble for later and can be solved by using solidifier layer/etc
 
+Conclusion: after 1 epoch it's good, after 2nd epoch it's so-so, trading going back and forth with xl-long-noreset(where pure rotary is used 
+through entire sequence, i.e. nth token of the sequence is located at offset=n)
+After during 3rd epoch it explodes, ocilating wildly around 4.3
+However valid loss are also at 4.29166650772095.
+Which is worse than 4.11614561080933 of prior XL experiment where memory was not forwarded.
+I also need to try at swap around theta/2 (5k) rather that ~theta/4 (2k)
+
+Experiment 7: NoPE/long
+Previously NoPE were trained in context window environment only.
+NoPE/long exposes positionless tokens to the entire sequence.
+Intuition is that after 3 epochs and being able to pass gradients through the entire sequence, the model will learn enough.
+Wikitext103 is "hard" text: PPL on PG19 are much better, so intuition is the model will be forced to learn that positions matters
+and gradient flow allows it
+
 ## Training
 TODO: training schedule
 
