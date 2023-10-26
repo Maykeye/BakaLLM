@@ -70,7 +70,14 @@ Previously NoPE were trained in context window environment only.
 NoPE/long exposes positionless tokens to the entire sequence.
 Intuition is that after 3 epochs and being able to pass gradients through the entire sequence, the model will learn enough.
 Wikitext103 is "hard" text: PPL on PG19 are much better, so intuition is the model will be forced to learn that positions matters
-and gradient flow allows it
+and gradient flow allows it.
+After 2 epochs loss = 5.95. Too much
+
+Experiment 8: Long version of Experiment 2; revisited.
+Use q_now, (k_past 🐱 k_now), shift q_now to match k_now
+Previosuly it was DNF. This time I'm willing to give 3 epochs
+
+Epcoh 3 loss: 4.10. New record, wrapping it up
 
 ## Training
 TODO: training schedule

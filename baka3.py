@@ -115,6 +115,7 @@ class BakaAttention(nn.Module):
         self.k = nn.Linear(config.dim_model, config.dim_attn, False)
         self.v = nn.Linear(config.dim_model, config.dim_model, False)
         self.o = nn.Linear(config.dim_model, config.dim_model, False)
+        self.rot = RotaryEmbedding(config.dim_head, use_xpos=False)
 
     def forward(self, state: BakaState):
         q, k, v = self.build_qkv(state)
@@ -158,6 +159,8 @@ class BakaAttention(nn.Module):
         state.k_cache = k
         state.v_cache = v
 
+        past_offset = current_offset = 0
+
         # restore the past
         if (past := state.past_predcessor_state):
             past_k = past.k_cache
@@ -165,6 +168,10 @@ class BakaAttention(nn.Module):
             assert past_k is not None and past_v is not None
             k = torch.cat((past_k, k), -2)
             v = torch.cat((past_v, v), -2)
+            current_offset = past.n_seq
+
+        q = self.rot.rotate_queries_or_keys(q, -2, offset=current_offset)
+        k = self.rot.rotate_queries_or_keys(k, -2, offset=past_offset)
 
         return q, k, v
 
