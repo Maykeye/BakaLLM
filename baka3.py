@@ -54,7 +54,6 @@ class BakaConfig:
     n_heads: int = 4
     n_vocab: int = 32000
     n_ctx: int = 512
-    n_history_rewind: int = 256*256*256  # Arbitrary large number to disable rewinding (Position rewinding NYI)
 
     act_fn: str = "elephant"
     model_type = "baka_xl"
