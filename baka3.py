@@ -322,7 +322,7 @@ def try_load(obj, path):
     return True
 
 
-def make_model(tokenizer) -> Tuple[BakaConfig, BakaNetCausalLM]:
+def make_model(tokenizer) -> BakaNetCausalLM:
     cfg = BakaConfig(
         dim_model=768,
         dim_ff=3072,
@@ -382,6 +382,8 @@ def main():
                       help="enable WANDB log")
     parser.add_option("-l", "--load", dest="do_load", action="store_true",
                       help="load existing model")
+    parser.add_option("-b", "--batch-size", dest="batch_size", default=5, type="int",
+                      help="do not save the progress(default: save)")
     parser.add_option("-S", "--no-save", dest="do_save", action="store_false", default=True,
                       help="do not save the progress(default: save)")
 
@@ -395,18 +397,20 @@ def main():
     project: str = options.project
     run_id: str = options.run_id
     assert run_id and run_id[-1].isdigit()
-    do_log = options.do_log
-    do_load = options.do_load
-    do_save = options.do_save or do_load
+    do_log: bool = options.do_log
+    do_load: bool = options.do_load
+    do_save: bool = options.do_save or do_load
+    batch_size: int = options.batch_size
 
     assert project, "project name is required"
     assert run_id, "run id is required"
     tokenizer = get_tokenizer()
-    dl = get_dl(tokenizer, batch_size=5)
+    dl = get_dl(tokenizer, batch_size=batch_size)
     clip = 1.0
     #
     model = make_model(tokenizer)
     training_ctx_size = 2048
+    n_ctx = model.config.n_ctx
     opt = torch.optim.AdamW(model.parameters())
 
     # PATH
@@ -425,7 +429,7 @@ def main():
 
     for i_batch, batch in enumerate(bar := tqdm(dl)):
         train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, write_log=write_log)
-        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=training_ctx_size//2, write_log=write_log)
+        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=n_ctx//2, write_log=write_log)
 
         if do_save and i_batch and i_batch % 50 == 0:
             torch.save(model.state_dict(), model_path)
