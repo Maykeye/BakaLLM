@@ -3,7 +3,6 @@ import optparse
 from tqdm.auto import tqdm
 import wandb
 import os
-from transformers import AutoTokenizer
 from transformers.activations import ACT2FN
 import torch
 from typing import Tuple
@@ -62,6 +61,7 @@ class BakaConfig:
     n_vocab: int = 32000
     n_ctx: int = 512
     n_pauses: int = 8
+    is_pause_pos_random: bool = False
 
     act_fn: str = "elephant"
     model_type = "baka_pause"
@@ -277,7 +277,12 @@ class BakaNet(nn.Module):
             return int(torch.randint(1, n+1, (1,)).item())
         
         # first pos is fixed to zero to emulate BOS
-        state.pauses_pos = [0] + [rand_pos(state.n_seq + i) for i in range(1, self.config.n_pauses)]
+        if self.config.is_pause_pos_random:
+            state.pauses_pos = [0] + [rand_pos(state.n_seq + i) for i in range(1, self.config.n_pauses)]
+        else:
+            step = self.config.n_ctx // (1+self.config.n_pauses)
+            state.pauses_pos = [step * i for i in range(self.config.n_pauses) if step*i <= state.n_seq]
+
         pause_emb = self.pause_emb.repeat(state.n_batch, 1, 1)
         x = state.input
         for pos in state.pauses_pos:
@@ -419,6 +424,8 @@ def main():
                       help="load existing model")
     parser.add_option("-b", "--batch-size", dest="batch_size", default=5, type="int",
                       help="do not save the progress(default: save)")
+    parser.add_option("-s", "--skip", dest="skip", type="int", metavar="N",
+                      help="skip N batches")
     parser.add_option("-S", "--no-save", dest="do_save", action="store_false", default=True,
                       help="do not save the progress(default: save)")
 
@@ -440,7 +447,7 @@ def main():
     assert project, "project name is required"
     assert run_id, "run id is required"
     tokenizer = get_tokenizer()
-    dl = get_dl(tokenizer, batch_size=batch_size)
+    dl = get_dl(tokenizer, batch_size=batch_size, n_skip_batches=options.skip)
     clip = 1.0
     #
     model = make_model(tokenizer)

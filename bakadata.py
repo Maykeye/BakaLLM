@@ -12,7 +12,7 @@ def tokenize_text(samples, tokenizer):
     return {"input_ids": tokenizer(text).input_ids}
 
 
-def get_dl(tokenizer, batch_size, split="train"):
+def get_dl(tokenizer, batch_size, split="train", n_skip_batches=0):
     ds = load_dataset("iohadrubin/wikitext-103-raw-v1")
     assert isinstance(ds, DatasetDict)  # keep LSP happy
     ds = ds[split]
@@ -23,10 +23,11 @@ def get_dl(tokenizer, batch_size, split="train"):
         fn_kwargs={"tokenizer": tokenizer},
         batched=True)
     collator = DataCollatorForLanguageModeling(tokenizer, False)
+    sampler = range(n_skip_batches * batch_size, len(ds))
     dl = DataLoader(
         ds,
         batch_size=batch_size,
-        shuffle=False,
+        sampler=sampler,
         collate_fn=collator)
     return dl
 

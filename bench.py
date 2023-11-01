@@ -160,6 +160,7 @@ def main():
 
     loaders = {
         "pythia-14m": partial(impl_load_transformers, "pythia-14m"),
+        "pythia-31m": partial(impl_load_transformers, "pythia-31m"),
         "pythia-70m": partial(impl_load_transformers, "pythia-70m-deduped"),
         "pythia-160m": partial(impl_load_transformers, "pythia-160m-deduped"),
         "pythia-1b": partial(impl_load_transformers, "pythia-1b-deduped"),
