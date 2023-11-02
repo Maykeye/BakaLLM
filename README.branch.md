@@ -1,5 +1,5 @@
-# BakaLLM: Remember Me, Transformer?
+# BakaLLM: Thin baka
 
-Added RMT inspired by https://arxiv.org/pdf/2207.06881.pdf
+Adding layers that have SelfAttn only to raise the number of tokens seen by XL
 
 ## Training

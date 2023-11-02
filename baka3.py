@@ -9,7 +9,7 @@ from typing import Tuple
 from torch import LongTensor, Tensor
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import einops, rearrange
+from einops import rearrange
 
 from dataclasses import dataclass
 import dataclasses
@@ -24,11 +24,6 @@ def model_numel(m: nn.Module):
     return sum(p.numel() for p in m.parameters())
 
 @dataclass
-class BakaRMTState:
-    lhs: int = 0
-    rhs: int = 0
-
-@dataclass
 class BakaState:
     """ Normalized state of the layer """
     input: Optional[Tensor] = None
@@ -38,7 +33,6 @@ class BakaState:
     k_cache: Optional[Tensor] = None
     v_cache: Optional[Tensor] = None
     pauses_pos: Optional[list[int]] = None
-    rmt: Optional[BakaRMTState] = None
     @property
     def n_seq(self):
         assert self.input is not None
@@ -157,17 +151,6 @@ class BakaAttention(nn.Module):
         # 1 1 1 1  1 0 0
         # 1 1 1 1  1 1 0
         # 1 1 1 1  1 1 1
-        if state.rmt:
-            if state.rmt.rhs:
-                # Write RMT memory applies to everything
-                mask[-state.rmt.rhs:] = 1
-
-            if state.rmt.lhs:
-                # Read RMT memory applies to itself, but not current block unlike the paper["Additionally, we allow all
-                # memory tokens in the read/write block to access all other tokens in the same block. "]: 
-                # If model learns top copy first N tokens into first N tokens of RMT-Read, during PPL calculation of these first N tokens, it can easily
-                # cheat and read them, which will be a disaster during the inference
-                mask[:state.rmt.lhs] = 1
 
         return False, mask
 
@@ -230,60 +213,12 @@ class BakaGLU(nn.Module):
         gate = self.ff_gate(x).sigmoid()
         x = self.ff(x)
         return x * gate
-
-class BakaRMT(nn.Module):
-    def __init__(self, config: BakaConfig):
-        super().__init__()
-        self.config = config
-        if self.config.rmt_solidifier == "none":
-            self.solidifier = nn.Identity()
-        elif self.config.rmt_solidifier == "glu":
-            self.solidifier = BakaGLU(config)
-        else:
-            raise ValueError(f"Unknown solidifier {self.config.rmt_solidifier}")
-
-        self.rmt_tokens = nn.Parameter(torch.randn(config.n_rmt_tokens, config.dim_model))
-
-    def inject(self, current_start: BakaState, last_end: Optional[BakaState]) -> BakaRMTState:
-        assert current_start.input is not None
-        rhs = self.rmt_tokens.repeat(current_start.n_batch, 1, 1)
-
-        if last_end is not None:
-            assert last_end.output is not None
-            n_margin = self.config.n_rmt_margins
-            lhs = last_end.output[:, -self.config.n_rmt_tokens:]
-            if n_margin:
-                lhs = lhs[:, n_margin:-n_margin]
-                margin_lhs = self.rmt_tokens[:n_margin].repeat(current_start.n_batch, 1, 1)
-                margin_rhs = self.rmt_tokens[-n_margin:].repeat(current_start.n_batch, 1, 1)
-                lhs = torch.cat((margin_lhs, lhs, margin_rhs))
-
-            lhs = self.solidifier(lhs)
-
-            current_start.input = torch.cat((lhs, current_start.input, rhs), 1)
-            return BakaRMTState(lhs=lhs.shape[1] , rhs=rhs.shape[1])
-        
-        current_start.input = torch.cat((current_start.input, rhs), 1)
-        return BakaRMTState(lhs=0, rhs=rhs.shape[1])
-
-    def detach(self, x: Tensor, state: BakaRMTState):
-        if state.lhs:
-            x = x[:, self.config.n_rmt_tokens:]
-        if state.rhs:
-            x = x[:, :-self.config.n_rmt_tokens]
-        return x
-
-    
-
-
-
 class BakaNet(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList([BakaLayer(config) for _ in range(config.n_layers)])
         self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
-        self.rmt = BakaRMT(config)
         # TODO: move pauses into its own module as rmt
         
 
@@ -319,7 +254,6 @@ class BakaNet(nn.Module):
             # pass input from the current context window
             states[0].input = input[:, pos:pos+self.config.n_ctx, :]
             self.inject_pauses(states[0])
-            rmt_state = self.rmt.inject(states[0], old_states[-1])
 
             # Move in the model top to bottom
             for i, layer in enumerate(self.layers):
@@ -338,7 +272,7 @@ class BakaNet(nn.Module):
             assert states[-1].pauses_pos is not None
             # Last layer represents everything we know so far, which is more than necessary
             # To get output, useable for loss calc, we need to remove pauses, RMT, etc
-            output = self.rmt.detach(states[-1].output, rmt_state)
+            output = states[-1].output
             output = self.output_without_pauses(output, states[-1].pauses_pos)
             outputs.append(output)
 
