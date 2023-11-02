@@ -161,13 +161,13 @@ class BakaAttention(nn.Module):
             if state.rmt.rhs:
                 # Write RMT memory applies to everything
                 mask[-state.rmt.rhs:] = 1
-
             if state.rmt.lhs:
                 # Read RMT memory applies to itself, but not current block unlike the paper["Additionally, we allow all
                 # memory tokens in the read/write block to access all other tokens in the same block. "]: 
                 # If model learns top copy first N tokens into first N tokens of RMT-Read, during PPL calculation of these first N tokens, it can easily
                 # cheat and read them, which will be a disaster during the inference
-                mask[:state.rmt.lhs] = 1
+                # TODO: can be optimized by fusing it into tril_ above
+                mask[:state.rmt.lhs, past_n_seq:past_n_seq+state.rmt.lhs] = 1
 
         return False, mask
 
@@ -320,12 +320,14 @@ class BakaNet(nn.Module):
             states[0].input = input[:, pos:pos+self.config.n_ctx, :]
             self.inject_pauses(states[0])
             rmt_state = self.rmt.inject(states[0], old_states[-1])
+            states[0].rmt = rmt_state
 
             # Move in the model top to bottom
             for i, layer in enumerate(self.layers):
                 # Link current state to the past state
                 states[i].past_predcessor_state = old_states[i-1] if i else None
                 states[i].pauses_pos = states[0].pauses_pos
+                states[i].rmt = states[0].rmt
 
                 # Link output of the intermediate layer to input of the next intermediate layer
                 if i:
