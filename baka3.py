@@ -9,7 +9,7 @@ from typing import Tuple
 from torch import LongTensor, Tensor
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
+from einops import einops, rearrange
 
 from dataclasses import dataclass
 import dataclasses
@@ -33,7 +33,6 @@ class BakaState:
     past_predcessor_state: Optional["BakaState"] = None  # if this is layer L at current chunk C, this field points to layer (L-1) in chunk (C-1)
     k_cache: Optional[Tensor] = None
     v_cache: Optional[Tensor] = None
-    attn_flip_state: bool = False
     pauses_pos: Optional[list[int]] = None
 
     @property
@@ -62,9 +61,11 @@ class BakaConfig:
     n_ctx: int = 512
     n_pauses: int = 8
     is_pause_pos_random: bool = False
-
+    n_rmt_tokens: int = 16
+    n_rmt_margins: int = 0
+    rmt_solidifier: str = "glu" # none, glu, layer, thinlayer
     act_fn: str = "elephant"
-    model_type = "baka_pause"
+    model_type = "baka_rmt"
 
     def __post_init__(self):
         self.dim_ff = self.dim_ff or self.dim_model * 4
@@ -201,6 +202,66 @@ class BakaLayer(nn.Module):
         state.output = y
         return y
 
+@dataclass
+class BakaRMTState:
+    lhs: bool = False
+    rhs: bool = False
+
+class BakaGLU(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.ff = nn.Linear(config.dim_model, config.dim_model)
+        self.ff_gate = nn.Linear(config.dim_model, config.dim_model)
+    def forward(self, x):
+        gate = self.ff_gate(x).sigmoid()
+        x = self.ff(x)
+        return x * gate
+
+class BakaRMT(nn.Module):
+    def __init__(self, config: BakaConfig):
+        super().__init__()
+        self.config = config
+        if self.config.rmt_solidifier == "none":
+            self.solidifier = nn.Identity()
+        elif self.config.rmt_solidifier == "glu":
+            self.solidifier = BakaGLU(config)
+        else:
+            raise ValueError(f"Unknown solidifier {self.config.rmt_solidifier}")
+
+        self.rmt_tokens = nn.Parameter(torch.randn(config.n_rmt_tokens, config.dim_model))
+
+    def inject(self, current_start: BakaState, last_end: Optional[BakaState]) -> BakaRMTState:
+        assert current_start.input is not None
+        rhs = self.rmt_tokens.repeat(current_start.n_batch, 1, 1)
+
+        if last_end is not None:
+            assert last_end.output is not None
+            n_margin = self.config.n_rmt_margins
+            lhs = last_end.output[:, -self.config.n_rmt_tokens:]
+            if n_margin:
+                lhs = lhs[:, n_margin:-n_margin]
+                margin_lhs = self.rmt_tokens[:n_margin].repeat(current_start.n_batch, 1, 1)
+                margin_rhs = self.rmt_tokens[-n_margin:].repeat(current_start.n_batch, 1, 1)
+                lhs = torch.cat((margin_lhs, lhs, margin_rhs))
+
+            lhs = self.solidifier(lhs)
+
+            current_start.input = torch.cat((lhs, current_start.input, rhs), 1)
+            return BakaRMTState(lhs=True, rhs=True)
+        
+        current_start.input = torch.cat((current_start.input, rhs), 1)
+        return BakaRMTState(lhs=False, rhs=True)
+
+    def detach(self, x: Tensor, state: BakaRMTState):
+        if state.lhs:
+            x = x[:, self.config.n_rmt_tokens:]
+        if state.rhs:
+            x = x[:, :-self.config.n_rmt_tokens]
+        return x
+
+    
+
+
 
 class BakaNet(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
@@ -208,6 +269,9 @@ class BakaNet(nn.Module):
         self.config = config
         self.layers = nn.ModuleList([BakaLayer(config) for _ in range(config.n_layers)])
         self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
+        self.rmt = BakaRMT(config)
+        # TODO: move pauses into its own module as rmt
+        
 
     def forward(self, 
                 input: Tensor, 
@@ -233,15 +297,15 @@ class BakaNet(nn.Module):
         # Prepare outputs for each chunk
         outputs = []
 
-        flip_flop = False
         # Move in context left to right
         for pos in range(0, n_seq, self.config.n_ctx):
             # Prepare this step state
-            states = [BakaState(input=None, offset=start_pos + pos, attn_flip_state=flip_flop) for _ in range(self.config.n_layers)]
+            states = [BakaState(input=None, offset=start_pos + pos) for _ in range(self.config.n_layers)]
 
             # pass input from the current context window
             states[0].input = input[:, pos:pos+self.config.n_ctx, :]
             self.inject_pauses(states[0])
+            rmt_state = self.rmt.inject(states[0], old_states[-1])
 
             # Move in the model top to bottom
             for i, layer in enumerate(self.layers):
@@ -256,8 +320,12 @@ class BakaNet(nn.Module):
                 # Let the layer cook current state
                 layer(states[i])
 
-            # Last layer represents everything we know so far
-            output = self.output_without_pauses(states[-1])
+            assert states[-1].output is not None
+            assert states[-1].pauses_pos is not None
+            # Last layer represents everything we know so far, which is more than necessary
+            # To get output, useable for loss calc, we need to remove pauses, RMT, etc
+            output = self.rmt.detach(states[-1].output, rmt_state)
+            output = self.output_without_pauses(output, states[-1].pauses_pos)
             outputs.append(output)
 
             # Shift current states into old states
@@ -266,10 +334,10 @@ class BakaNet(nn.Module):
             # Detach older states
             for state in old_states:
                 state.past_predcessor_state = None 
-            flip_flop = not flip_flop
 
         outputs = torch.cat(outputs, 1)
         return outputs, old_states or [] # type: ignore
+
 
     def inject_pauses(self, state:BakaState):
         assert state.input is not None
@@ -289,11 +357,8 @@ class BakaNet(nn.Module):
             x = torch.cat((x[:, :pos], pause_emb, x[:, pos:]), 1)
         state.input = x
 
-    def output_without_pauses(self, state: BakaState):
-        assert state.output is not None
-        assert state.pauses_pos is not None
-        x = state.output
-        for pos in reversed(state.pauses_pos):
+    def output_without_pauses(self, x: Tensor, pauses_pos: list[int]):
+        for pos in reversed(pauses_pos):
             x = torch.cat((x[:, :pos], x[:, pos+1:]), 1)
         return x
 
@@ -381,7 +446,7 @@ def gen_model_path(project, model):
     return model_path
 
 
-def propogate_past_states(past: list[BakaState], mb: MiniBatch):
+def propogate_past_states(past: Optional[list[BakaState]], mb: MiniBatch, detach=False):
     if not past:
         return
     keys = list(dataclasses.asdict(BakaState()).keys())
@@ -394,13 +459,21 @@ def propogate_past_states(past: list[BakaState], mb: MiniBatch):
             if not isinstance(v, torch.Tensor):
                 continue
             v = mb.pass_batch_from_past_to_present(v)
+            if detach:
+                v = v.detach()
             setattr(state, k, v)
 
 
-def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=0, write_log=None):
+def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=0, detach_at = 0, write_log=None):
     past = None
-    for mb in batch_iterator(batch, n_ctx=training_ctx_size, n_stride=training_ctx_size, tokenizer=tokenizer, n_skip_first=n_skip_first):
-        past = propogate_past_states(past, mb)
+
+    for i, mb in enumerate(batch_iterator(batch, 
+                                          n_ctx=training_ctx_size, 
+                                          n_stride=training_ctx_size, 
+                                          tokenizer=tokenizer, 
+                                          n_skip_first=n_skip_first)):
+        should_detach = detach_at != 0 and i % detach_at == 0
+        past = propogate_past_states(past, mb, detach=should_detach)
         out = model(input_ids=mb.input_ids, labels=mb.labels, old_states=past)
         past = out.states
         loss = out.loss
@@ -424,10 +497,11 @@ def main():
                       help="load existing model")
     parser.add_option("-b", "--batch-size", dest="batch_size", default=5, type="int",
                       help="do not save the progress(default: save)")
-    parser.add_option("-s", "--skip", dest="skip", type="int", metavar="N",
+    parser.add_option("-s", "--skip", dest="skip", type="int", metavar="N", default=0,
                       help="skip N batches")
     parser.add_option("-S", "--no-save", dest="do_save", action="store_false", default=True,
                       help="do not save the progress(default: save)")
+    parser.add_option("-d", "--detach", metavar="N", help="stop gradient after N steps", type="int", default=8)
 
     debug_args = None
     if sys.gettrace():
@@ -443,6 +517,7 @@ def main():
     do_load: bool = options.do_load
     do_save: bool = options.do_save or do_load
     batch_size: int = options.batch_size
+    detach_at: int = options.detach
 
     assert project, "project name is required"
     assert run_id, "run id is required"
@@ -470,8 +545,10 @@ def main():
             wandb_log(loss=loss.item(), project=f"baka3-{project}", run_id=run_id)
 
     for i_batch, batch in enumerate(bar := tqdm(dl)):
-        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, write_log=write_log)
-        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=n_ctx//2, write_log=write_log)
+        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, 
+                    n_skip_first=0, detach_at=detach_at, write_log=write_log)
+        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, 
+                    n_skip_first=n_ctx//2, detach_at=detach_at, write_log=write_log)
 
         if do_save and i_batch and i_batch % 50 == 0:
             torch.save(model.state_dict(), model_path)
