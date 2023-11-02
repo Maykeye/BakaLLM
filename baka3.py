@@ -23,6 +23,10 @@ from bakadata import get_dl, get_tokenizer, batch_iterator, MiniBatch
 def model_numel(m: nn.Module):
     return sum(p.numel() for p in m.parameters())
 
+@dataclass
+class BakaRMTState:
+    lhs: int = 0
+    rhs: int = 0
 
 @dataclass
 class BakaState:
@@ -34,7 +38,7 @@ class BakaState:
     k_cache: Optional[Tensor] = None
     v_cache: Optional[Tensor] = None
     pauses_pos: Optional[list[int]] = None
-
+    rmt: Optional[BakaRMTState] = None
     @property
     def n_seq(self):
         assert self.input is not None
@@ -63,7 +67,7 @@ class BakaConfig:
     is_pause_pos_random: bool = False
     n_rmt_tokens: int = 16
     n_rmt_margins: int = 0
-    rmt_solidifier: str = "glu" # none, glu, layer, thinlayer
+    rmt_solidifier: str = "none" # none, glu, layer, thinlayer
     act_fn: str = "elephant"
     model_type = "baka_rmt"
 
@@ -137,6 +141,8 @@ class BakaAttention(nn.Module):
         # Will not be required in future versions of pytorch, hopefully.
         # See https://github.com/pytorch/pytorch/issues/108108
         if state.past_predcessor_state is None:
+            # No RMT here, which is not really ideal as RMT[-2] will not attend to following RMT[-1],
+            # but it happens only once per sequence
             return True, None
         now_n_seq = state.n_seq
         past_n_seq = state.past_predcessor_state.n_seq
@@ -151,6 +157,18 @@ class BakaAttention(nn.Module):
         # 1 1 1 1  1 0 0
         # 1 1 1 1  1 1 0
         # 1 1 1 1  1 1 1
+        if state.rmt:
+            if state.rmt.rhs:
+                # Write RMT memory applies to everything
+                mask[-state.rmt.rhs:] = 1
+
+            if state.rmt.lhs:
+                # Read RMT memory applies to itself, but not current block unlike the paper["Additionally, we allow all
+                # memory tokens in the read/write block to access all other tokens in the same block. "]: 
+                # If model learns top copy first N tokens into first N tokens of RMT-Read, during PPL calculation of these first N tokens, it can easily
+                # cheat and read them, which will be a disaster during the inference
+                mask[:state.rmt.lhs] = 1
+
         return False, mask
 
     def build_qkv(self, state: BakaState):
@@ -202,10 +220,6 @@ class BakaLayer(nn.Module):
         state.output = y
         return y
 
-@dataclass
-class BakaRMTState:
-    lhs: bool = False
-    rhs: bool = False
 
 class BakaGLU(nn.Module):
     def __init__(self, config) -> None:
@@ -247,10 +261,10 @@ class BakaRMT(nn.Module):
             lhs = self.solidifier(lhs)
 
             current_start.input = torch.cat((lhs, current_start.input, rhs), 1)
-            return BakaRMTState(lhs=True, rhs=True)
+            return BakaRMTState(lhs=lhs.shape[1] , rhs=rhs.shape[1])
         
         current_start.input = torch.cat((current_start.input, rhs), 1)
-        return BakaRMTState(lhs=False, rhs=True)
+        return BakaRMTState(lhs=0, rhs=rhs.shape[1])
 
     def detach(self, x: Tensor, state: BakaRMTState):
         if state.lhs:
