@@ -103,13 +103,15 @@ class BakaMLP(nn.Module):
         super().__init__()
         self.config = config
         self.act = make_activation_fn(self.config.act_fn)
+        self.norm_in = nn.LayerNorm(config.dim_model)
         self.fc_gate = nn.Linear(config.dim_model, config.dim_ff, False)
         self.fc_up = nn.Linear(config.dim_model, config.dim_ff, False)
         self.fc_down = nn.Linear(config.dim_ff, config.dim_model, False)
 
     def forward(self, state: BakaState):
-        gate = self.act(self.fc_gate(state.input))
-        y = self.fc_up(state.input) * gate
+        input = self.norm_in(state.input)
+        gate = self.act(self.fc_gate(input))
+        y = self.fc_up(input) * gate
         y = self.fc_down(y)
         return y
 
@@ -123,6 +125,7 @@ class BakaAttention(nn.Module):
         self.v = nn.Linear(config.dim_model, config.dim_model, False)
         self.o = nn.Linear(config.dim_model, config.dim_model, False)
         self.rot = RotaryEmbedding(config.dim_head, use_xpos=False)
+        self.norm_in = nn.LayerNorm(config.dim_model)
 
     def forward(self, state: BakaState):
         q, k, v = self.build_qkv(state)
@@ -153,10 +156,11 @@ class BakaAttention(nn.Module):
         return False, mask
 
     def build_qkv(self, state: BakaState):
+        input = self.norm_in(state.input)
         # project
-        q = self.q(state.input)
-        k = self.k(state.input)
-        v = self.v(state.input)
+        q = self.q(input)
+        k = self.k(input)
+        v = self.v(input)
 
         q = rearrange(q, "b t (h f) -> b h t f", h=self.config.n_heads)
         k = rearrange(k, "b t (h f) -> b h t f", h=self.config.n_heads)
@@ -187,14 +191,12 @@ class BakaLayer(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
-        self.norm_in = nn.LayerNorm(config.dim_model)
         self.attn = BakaAttention(config)
         self.mlp = BakaMLP(config)
 
     def forward(self, state: BakaState):
         y = state.input
         assert y is not None
-        state.input = self.norm_in(state.input)
         attn = self.attn(state)
         mlp = self.mlp(state)
         y = y + attn + mlp

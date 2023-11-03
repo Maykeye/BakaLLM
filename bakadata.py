@@ -23,6 +23,7 @@ def get_dl(tokenizer, batch_size, split="train", n_skip_batches=0):
         fn_kwargs={"tokenizer": tokenizer},
         batched=True)
     collator = DataCollatorForLanguageModeling(tokenizer, False)
+    n_skip_batches = n_skip_batches or 0
     sampler = range(n_skip_batches * batch_size, len(ds))
     dl = DataLoader(
         ds,
