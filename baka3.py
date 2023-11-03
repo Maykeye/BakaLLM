@@ -53,7 +53,8 @@ class BakaConfig:
     dim_model: int = 1024
     dim_ff: int = 0
     dim_attn: int = 0
-    n_layers: int = 12
+    n_layers_normal: int = 12
+    n_layers_thin: int = 4
     n_heads: int = 4
     n_vocab: int = 32000
     n_ctx: int = 512
@@ -64,12 +65,15 @@ class BakaConfig:
     rmt_solidifier: str = "none" # none, glu, layer, thinlayer
     act_fn: str = "elephant"
     model_type = "baka_rmt"
-
+    
     def __post_init__(self):
         self.dim_ff = self.dim_ff or self.dim_model * 4
         self.dim_attn = self.dim_attn or self.dim_model
         assert self.dim_attn % self.n_heads == 0
 
+    @property
+    def n_layers_total(self):
+        return self.n_layers_thin + self.n_layers_normal
     @property
     def dim_head(self):
         return self.dim_attn // self.n_heads
@@ -186,38 +190,48 @@ class BakaAttention(nn.Module):
 
 
 class BakaLayer(nn.Module):
-    def __init__(self, config: BakaConfig) -> None:
+    KIND_THIN = "thin"
+    KIND_NORMAL = "normal"
+
+    def __init__(self, config: BakaConfig, kind="normal") -> None:
         super().__init__()
         self.config = config
         self.norm_in = nn.LayerNorm(config.dim_model)
         self.attn = BakaAttention(config)
-        self.mlp = BakaMLP(config)
+        self.kind = kind
+        if self.kind == BakaLayer.KIND_NORMAL:
+            self.mlp = BakaMLP(config)
+        elif self.kind == BakaLayer.KIND_THIN:
+            self.mlp = None
+            # Thin layer by default are next to zero
+            for p in self.attn.parameters():
+                p.data *= 0.0001
 
     def forward(self, state: BakaState):
         y = state.input
         assert y is not None
         state.input = self.norm_in(state.input)
         attn = self.attn(state)
-        mlp = self.mlp(state)
-        y = y + attn + mlp
+        y = y + attn
+        if self.mlp:
+            mlp = self.mlp(state)
+            y = y + mlp
         state.output = y
         return y
 
-
-class BakaGLU(nn.Module):
-    def __init__(self, config) -> None:
-        super().__init__()
-        self.ff = nn.Linear(config.dim_model, config.dim_model)
-        self.ff_gate = nn.Linear(config.dim_model, config.dim_model)
-    def forward(self, x):
-        gate = self.ff_gate(x).sigmoid()
-        x = self.ff(x)
-        return x * gate
 class BakaNet(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
-        self.layers = nn.ModuleList([BakaLayer(config) for _ in range(config.n_layers)])
+        
+        self.layers = nn.ModuleList(
+                [BakaLayer(config, kind=BakaLayer.KIND_THIN) for _ in range(config.n_layers_thin)] +
+                [BakaLayer(config) for _ in range(config.n_layers_normal)])
+        layers = nn.ModuleList()
+
+
+
+
         self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
         # TODO: move pauses into its own module as rmt
         
@@ -235,7 +249,7 @@ class BakaNet(nn.Module):
 
         # Prepare placeholder for past state if nothing was provided
         if old_states is None:
-            old_states = [None for _ in range(self.config.n_layers)] #type: ignore
+            old_states = [None for _ in range(self.config.n_layers_total)] #type: ignore
 
 
         # Calculate the start position from the start position and length of the last chunk (if any)
@@ -249,7 +263,7 @@ class BakaNet(nn.Module):
         # Move in context left to right
         for pos in range(0, n_seq, self.config.n_ctx):
             # Prepare this step state
-            states = [BakaState(input=None, offset=start_pos + pos) for _ in range(self.config.n_layers)]
+            states = [BakaState(input=None, offset=start_pos + pos) for _ in range(self.config.n_layers_total)]
 
             # pass input from the current context window
             states[0].input = input[:, pos:pos+self.config.n_ctx, :]
@@ -380,7 +394,8 @@ def make_model(tokenizer) -> BakaNetCausalLM:
         dim_model=768,
         dim_ff=3072,
         n_heads=12,
-        n_layers=12,
+        n_layers_normal=12,
+        n_layers_thin=4,
         n_vocab=len(tokenizer))
     model = BakaNetCausalLM(cfg).bfloat16().cuda()
     return model
