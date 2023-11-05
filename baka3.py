@@ -33,7 +33,6 @@ class BakaState:
     past_predcessor_state: Optional["BakaState"] = None  # if this is layer L at current chunk C, this field points to layer (L-1) in chunk (C-1)
     k_cache: Optional[Tensor] = None
     v_cache: Optional[Tensor] = None
-    attn_flip_state: bool = False
     pauses_pos: Optional[list[int]] = None
 
     @property
@@ -201,16 +200,45 @@ class BakaLayer(nn.Module):
         state.output = y
         return y
 
+class BakaPause(nn.Module):
+    def __init__(self, config: BakaConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
+
+    def inject(self, state:BakaState):
+        assert state.input is not None
+        def rand_pos(n) -> int:
+            return int(torch.randint(1, n+1, (1,)).item())
+
+        # first pos is fixed to zero to emulate BOS
+        if self.config.is_pause_pos_random:
+            state.pauses_pos = [0] + [rand_pos(state.n_seq + i) for i in range(1, self.config.n_pauses)]
+        else:
+            step = self.config.n_ctx // (self.config.n_pauses)
+            state.pauses_pos = [step * i for i in range(self.config.n_pauses) if step*i <= state.n_seq]
+
+        pause_emb = self.pause_emb.repeat(state.n_batch, 1, 1)
+        x = state.input
+        for pos in state.pauses_pos:
+            x = torch.cat((x[:, :pos], pause_emb, x[:, pos:]), 1)
+        state.input = x
+
+    def removed(self, x: Tensor, pauses_pos: list[int]):
+        for pos in reversed(pauses_pos):
+            x = torch.cat((x[:, :pos], x[:, pos+1:]), 1)
+        return x
+
 
 class BakaNet(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList([BakaLayer(config) for _ in range(config.n_layers)])
-        self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
+        self.pause = BakaPause(config)
 
-    def forward(self, 
-                input: Tensor, 
+    def forward(self,
+                input: Tensor,
                 old_states: Optional[list[Optional[BakaState]]] = None # type: ignore
         ) -> Tuple[Tensor, list[BakaState]]:
         # TODO output_states flag
@@ -233,15 +261,14 @@ class BakaNet(nn.Module):
         # Prepare outputs for each chunk
         outputs = []
 
-        flip_flop = False
         # Move in context left to right
         for pos in range(0, n_seq, self.config.n_ctx):
             # Prepare this step state
-            states = [BakaState(input=None, offset=start_pos + pos, attn_flip_state=flip_flop) for _ in range(self.config.n_layers)]
+            states = [BakaState(input=None, offset=start_pos + pos) for _ in range(self.config.n_layers)]
 
             # pass input from the current context window
             states[0].input = input[:, pos:pos+self.config.n_ctx, :]
-            self.inject_pauses(states[0])
+            self.pause.inject(states[0])
 
             # Move in the model top to bottom
             for i, layer in enumerate(self.layers):
@@ -257,45 +284,20 @@ class BakaNet(nn.Module):
                 layer(states[i])
 
             # Last layer represents everything we know so far
-            output = self.output_without_pauses(states[-1])
+            assert states[-1].pauses_pos is not None
+            assert states[-1].output is not None
+            output = self.pause.removed(states[-1].output, states[-1].pauses_pos)
             outputs.append(output)
 
             # Shift current states into old states
-            old_states: list[BakaState] = states #type: ignore
+            old_states: list[BakaState] = states
 
             # Detach older states
             for state in old_states:
-                state.past_predcessor_state = None 
-            flip_flop = not flip_flop
+                state.past_predcessor_state = None
 
         outputs = torch.cat(outputs, 1)
         return outputs, old_states or [] # type: ignore
-
-    def inject_pauses(self, state:BakaState):
-        assert state.input is not None
-        def rand_pos(n) -> int:
-            return int(torch.randint(1, n+1, (1,)).item())
-        
-        # first pos is fixed to zero to emulate BOS
-        if self.config.is_pause_pos_random:
-            state.pauses_pos = [0] + [rand_pos(state.n_seq + i) for i in range(1, self.config.n_pauses)]
-        else:
-            step = self.config.n_ctx // (1+self.config.n_pauses)
-            state.pauses_pos = [step * i for i in range(self.config.n_pauses) if step*i <= state.n_seq]
-
-        pause_emb = self.pause_emb.repeat(state.n_batch, 1, 1)
-        x = state.input
-        for pos in state.pauses_pos:
-            x = torch.cat((x[:, :pos], pause_emb, x[:, pos:]), 1)
-        state.input = x
-
-    def output_without_pauses(self, state: BakaState):
-        assert state.output is not None
-        assert state.pauses_pos is not None
-        x = state.output
-        for pos in reversed(state.pauses_pos):
-            x = torch.cat((x[:, :pos], x[:, pos+1:]), 1)
-        return x
 
 @dataclass
 class BakaCausalLMOutput:
@@ -314,7 +316,7 @@ class BakaNetCausalLM(nn.Module):
         self.vocab_out = nn.Linear(config.dim_model, config.n_vocab, False)
 
         # HF compatibility hack
-        self.model.get_input_embeddings = lambda: self.vocab_in
+        self.model.get_input_embeddings = lambda: self.vocab_in #type: ignore
 
     def forward(self,
                 input_ids: LongTensor,
