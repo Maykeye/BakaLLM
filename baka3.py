@@ -96,15 +96,35 @@ def make_activation_fn(s):
         return act()
     return ACT2FN[s]
 
+def make_linear(dim_from, dim_to, *, bias):
+    fc = nn.Linear(dim_from, dim_to, bias=bias)
+    torch.nn.init.kaiming_normal_(fc.weight.data, a = 5**0.5) # Reasoning: personal preference
+    return fc
+
+class BakaRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        BakaRMSNorm is equivalent to T5LayerNorm from HF's transformers (including F32 cast)
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
 
 class BakaMLP(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
         self.act = make_activation_fn(self.config.act_fn)
-        self.fc_gate = nn.Linear(config.dim_model, config.dim_ff, False)
-        self.fc_up = nn.Linear(config.dim_model, config.dim_ff, False)
-        self.fc_down = nn.Linear(config.dim_ff, config.dim_model, False)
+        self.fc_gate = make_linear(config.dim_model, config.dim_ff, bias=False)
+        self.fc_up = make_linear(config.dim_model, config.dim_ff, bias=False)
+        self.fc_down = make_linear(config.dim_ff, config.dim_model, bias=False)
 
     def forward(self, state: BakaState):
         gate = self.act(self.fc_gate(state.input))
@@ -117,10 +137,10 @@ class BakaAttention(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
-        self.q = nn.Linear(config.dim_model, config.dim_attn, False)
-        self.k = nn.Linear(config.dim_model, config.dim_attn, False)
-        self.v = nn.Linear(config.dim_model, config.dim_model, False)
-        self.o = nn.Linear(config.dim_model, config.dim_model, False)
+        self.q = make_linear(config.dim_model, config.dim_attn, bias=False)
+        self.k = make_linear(config.dim_model, config.dim_attn, bias=False)
+        self.v = make_linear(config.dim_model, config.dim_model, bias=False)
+        self.o = make_linear(config.dim_model, config.dim_model, bias=False)
         self.rot = RotaryEmbedding(config.dim_head, use_xpos=False)
 
     def forward(self, state: BakaState):
@@ -186,7 +206,7 @@ class BakaLayer(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
-        self.norm_in = nn.LayerNorm(config.dim_model)
+        self.norm_in = BakaRMSNorm(config.dim_model)
         self.attn = BakaAttention(config)
         self.mlp = BakaMLP(config)
 
@@ -312,8 +332,8 @@ class BakaNetCausalLM(nn.Module):
         self.config = config
         self.model = BakaNet(config)
         self.vocab_in = nn.Embedding(config.n_vocab, config.dim_model)
-        self.norm_out = nn.LayerNorm(config.dim_model)
-        self.vocab_out = nn.Linear(config.dim_model, config.n_vocab, False)
+        self.norm_out = BakaRMSNorm(config.dim_model)
+        self.vocab_out = make_linear(config.dim_model, config.n_vocab, bias=False)
 
         # HF compatibility hack
         self.model.get_input_embeddings = lambda: self.vocab_in #type: ignore
