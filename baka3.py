@@ -13,6 +13,8 @@ from einops import rearrange
 
 from dataclasses import dataclass
 import dataclasses
+
+import dataclasses
 from typing import Optional
 
 from rotary_embedding_torch import RotaryEmbedding
@@ -64,7 +66,7 @@ class BakaConfig:
     n_rmt_margins: int = 0
     rmt_solidifier: str = "none" # none, glu, layer, thinlayer
     act_fn: str = "elephant"
-    model_type = "baka_thick_naive"
+    model_type = "baka_thick_mlp"
     
     def __post_init__(self):
         self.dim_ff = self.dim_ff or self.dim_model * 4
@@ -190,34 +192,34 @@ class BakaAttention(nn.Module):
 
 
 class BakaLayer(nn.Module):
-    KIND_THICK_TWIN = "thick_twin"
+    KIND_THICK_MLP = "thick_mlp"
     KIND_THIN = "thin"
     KIND_NORMAL = "normal"
 
     def __init__(self, config: BakaConfig, kind="normal") -> None:
         super().__init__()
-        assert kind in [BakaLayer.KIND_NORMAL, BakaLayer.KIND_THICK_TWIN, BakaLayer.KIND_THIN]
+        assert kind in [BakaLayer.KIND_NORMAL, BakaLayer.KIND_THICK_MLP, BakaLayer.KIND_THIN]
         self.config = config
         self.norm_in = nn.LayerNorm(config.dim_model)
         self.attn = BakaAttention(config)
         self.kind = kind
-        self.twin = None
 
         self.mlp = None if self.kind == BakaLayer.KIND_THIN else BakaMLP(config)
         if self.kind == BakaLayer.KIND_THIN:
+            self.mlp = None
             # Thin layer by default are next to zero
             for p in self.attn.parameters():
                 p.data *= 0.0001
-
-        if self.kind == BakaLayer.KIND_THICK_TWIN:
-            self.twin = BakaLayer(config)
+        elif self.kind == BakaLayer.KIND_THICK_MLP:
+            thick_config = dataclasses.replace(config, dim_ff=config.dim_ff*2)
+            self.mlp = BakaMLP(thick_config)
+        else:
+            self.mlp = BakaMLP(config)
 
 
     def forward(self, state: BakaState, use_residual = True):
         assert state.input is not None
         x = state.input
-        if self.twin is not None:
-            twin = self.twin(state, use_residual=False)
         state.input = self.norm_in(x)
         attn = self.attn(state)
         y = attn
@@ -234,7 +236,7 @@ class BakaNet(nn.Module):
         super().__init__()
         self.config = config
         
-        thick_layers = [BakaLayer(config, kind=BakaLayer.KIND_THICK_TWIN) for _ in range(config.n_thick_layers)]
+        thick_layers = [BakaLayer(config, kind=BakaLayer.KIND_THICK_MLP) for _ in range(config.n_thick_layers)]
         normal_layers = [BakaLayer(config, kind=BakaLayer.KIND_NORMAL) for _ in range(config.n_layers_normal)]
         layers = thick_layers + normal_layers
         self.layers = nn.ModuleList(layers)

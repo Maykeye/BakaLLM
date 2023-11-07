@@ -9,10 +9,13 @@ Adding layers that have SelfAttn only to raise the number of tokens seen by XL
 
 Thick layers make everything thin compared to selected layers
 
-[ ] Thick layer/naive at start: layer 0 in parallel calls another layer with attn and mlp. XL focuses on main layer attn; attn of other layer ignored
- ^ current focus
+[+] Thick layer/naive at start: layer 0 in parallel calls another layer with attn and mlp. XL focuses on main layer attn; attn of other layer ignored
+ aloss 4.53854 -- potentially good, but not 9M more good
 [ ] Thick layer/mlp at start: layer 0 has bigger MLP, attn not affected
+ ^ current focus
 [ ] Thick layer/attn at start: layer 0 has bigger dim_attn, mlp not affected
 [ ] Thick layer/ at start: layer 0 has bigger dim_attn and MLP
+[ ] Non thick: increase dim_model
+[ ] Non thick: increase dim_ff
 
 In case experiment will succeed, repeat, but give half parameters to last layer
