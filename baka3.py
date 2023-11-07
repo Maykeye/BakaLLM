@@ -55,6 +55,7 @@ class BakaConfig:
     dim_attn: int = 0
     n_layers_normal: int = 12
     n_layers_thin: int = 4
+    pos_layers_thin: int = 6
     n_heads: int = 4
     n_vocab: int = 32000
     n_ctx: int = 512
@@ -224,14 +225,10 @@ class BakaNet(nn.Module):
         super().__init__()
         self.config = config
         
-        self.layers = nn.ModuleList(
-                [BakaLayer(config, kind=BakaLayer.KIND_THIN) for _ in range(config.n_layers_thin)] +
-                [BakaLayer(config) for _ in range(config.n_layers_normal)])
-        layers = nn.ModuleList()
-
-
-
-
+        thin_layers = [BakaLayer(config, kind=BakaLayer.KIND_THIN) for _ in range(config.n_layers_thin)]
+        normal_layers = [BakaLayer(config, kind=BakaLayer.KIND_NORMAL) for _ in range(config.n_layers_normal)]
+        layers = normal_layers[:config.pos_layers_thin] + thin_layers + normal_layers[config.pos_layers_thin:]
+        self.layers = nn.ModuleList(layers)
         self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
         # TODO: move pauses into its own module as rmt
         
@@ -388,15 +385,17 @@ def try_load(obj, path):
     obj.load_state_dict(torch.load(path))
     return True
 
-
-def make_model(tokenizer) -> BakaNetCausalLM:
-    cfg = BakaConfig(
+def make_config(tokenizer) -> BakaConfig:
+    return BakaConfig(
         dim_model=768,
         dim_ff=3072,
         n_heads=12,
         n_layers_normal=12,
         n_layers_thin=4,
         n_vocab=len(tokenizer))
+
+def make_model(tokenizer) -> BakaNetCausalLM:
+    cfg = make_config(tokenizer)
     model = BakaNetCausalLM(cfg).bfloat16().cuda()
     return model
 
