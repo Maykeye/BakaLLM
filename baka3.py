@@ -53,9 +53,8 @@ class BakaConfig:
     dim_model: int = 1024
     dim_ff: int = 0
     dim_attn: int = 0
-    n_layers_normal: int = 12
-    n_layers_thin: int = 4
-    pos_layers_thin: int = 6
+    n_thick_layers: int = 1
+    n_layers_normal: int = 11
     n_heads: int = 4
     n_vocab: int = 32000
     n_ctx: int = 512
@@ -65,7 +64,7 @@ class BakaConfig:
     n_rmt_margins: int = 0
     rmt_solidifier: str = "none" # none, glu, layer, thinlayer
     act_fn: str = "elephant"
-    model_type = "baka_rmt"
+    model_type = "baka_thick_naive"
     
     def __post_init__(self):
         self.dim_ff = self.dim_ff or self.dim_model * 4
@@ -74,7 +73,7 @@ class BakaConfig:
 
     @property
     def n_layers_total(self):
-        return self.n_layers_thin + self.n_layers_normal
+        return self.n_layers_normal + self.n_thick_layers
     @property
     def dim_head(self):
         return self.dim_attn // self.n_heads
@@ -191,32 +190,42 @@ class BakaAttention(nn.Module):
 
 
 class BakaLayer(nn.Module):
+    KIND_THICK_TWIN = "thick_twin"
     KIND_THIN = "thin"
     KIND_NORMAL = "normal"
 
     def __init__(self, config: BakaConfig, kind="normal") -> None:
         super().__init__()
+        assert kind in [BakaLayer.KIND_NORMAL, BakaLayer.KIND_THICK_TWIN, BakaLayer.KIND_THIN]
         self.config = config
         self.norm_in = nn.LayerNorm(config.dim_model)
         self.attn = BakaAttention(config)
         self.kind = kind
-        if self.kind == BakaLayer.KIND_NORMAL:
-            self.mlp = BakaMLP(config)
-        elif self.kind == BakaLayer.KIND_THIN:
-            self.mlp = None
+        self.twin = None
+
+        self.mlp = None if self.kind == BakaLayer.KIND_THIN else BakaMLP(config)
+        if self.kind == BakaLayer.KIND_THIN:
             # Thin layer by default are next to zero
             for p in self.attn.parameters():
                 p.data *= 0.0001
 
-    def forward(self, state: BakaState):
-        y = state.input
-        assert y is not None
-        state.input = self.norm_in(state.input)
+        if self.kind == BakaLayer.KIND_THICK_TWIN:
+            self.twin = BakaLayer(config)
+
+
+    def forward(self, state: BakaState, use_residual = True):
+        assert state.input is not None
+        x = state.input
+        if self.twin is not None:
+            twin = self.twin(state, use_residual=False)
+        state.input = self.norm_in(x)
         attn = self.attn(state)
-        y = y + attn
-        if self.mlp:
+        y = attn
+        if self.mlp is not None:
             mlp = self.mlp(state)
             y = y + mlp
+        if use_residual:
+            y = y + x
         state.output = y
         return y
 
@@ -225,9 +234,9 @@ class BakaNet(nn.Module):
         super().__init__()
         self.config = config
         
-        thin_layers = [BakaLayer(config, kind=BakaLayer.KIND_THIN) for _ in range(config.n_layers_thin)]
+        thick_layers = [BakaLayer(config, kind=BakaLayer.KIND_THICK_TWIN) for _ in range(config.n_thick_layers)]
         normal_layers = [BakaLayer(config, kind=BakaLayer.KIND_NORMAL) for _ in range(config.n_layers_normal)]
-        layers = normal_layers[:config.pos_layers_thin] + thin_layers + normal_layers[config.pos_layers_thin:]
+        layers = thick_layers + normal_layers
         self.layers = nn.ModuleList(layers)
         self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
         # TODO: move pauses into its own module as rmt
@@ -386,13 +395,7 @@ def try_load(obj, path):
     return True
 
 def make_config(tokenizer) -> BakaConfig:
-    return BakaConfig(
-        dim_model=768,
-        dim_ff=3072,
-        n_heads=12,
-        n_layers_normal=12,
-        n_layers_thin=4,
-        n_vocab=len(tokenizer))
+    return BakaConfig(dim_model=768, dim_ff=3072, n_heads=12, n_vocab=len(tokenizer))
 
 def make_model(tokenizer) -> BakaNetCausalLM:
     cfg = make_config(tokenizer)
