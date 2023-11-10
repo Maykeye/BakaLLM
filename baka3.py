@@ -50,13 +50,18 @@ class BakaState:
         return self.input.device
 
 
+KIND_THICK_MLP = "thick_mlp"
+KIND_THIN_MLP = "thin_mlp"
+KIND_NORMAL = "normal"
+
 @dataclass
 class BakaConfig:
     dim_model: int = 1024
     dim_ff: int = 0
     dim_attn: int = 0
-    n_thick_layers: int = 1
-    n_layers_normal: int = 11
+    layer_types = [KIND_THICK_MLP, KIND_NORMAL, KIND_NORMAL, KIND_NORMAL,
+                   KIND_THIN_MLP, KIND_THIN_MLP, KIND_THIN_MLP, KIND_THIN_MLP,
+                   KIND_NORMAL, KIND_NORMAL, KIND_NORMAL, KIND_NORMAL]
     n_heads: int = 4
     n_vocab: int = 32000
     n_ctx: int = 512
@@ -75,7 +80,7 @@ class BakaConfig:
 
     @property
     def n_layers_total(self):
-        return self.n_layers_normal + self.n_thick_layers
+        return len(self.layer_types)
     @property
     def dim_head(self):
         return self.dim_attn // self.n_heads
@@ -192,28 +197,23 @@ class BakaAttention(nn.Module):
 
 
 class BakaLayer(nn.Module):
-    KIND_THICK_MLP = "thick_mlp"
-    KIND_THIN = "thin"
-    KIND_NORMAL = "normal"
 
     def __init__(self, config: BakaConfig, kind="normal") -> None:
         super().__init__()
-        assert kind in [BakaLayer.KIND_NORMAL, BakaLayer.KIND_THICK_MLP, BakaLayer.KIND_THIN]
+        assert kind in [KIND_NORMAL, KIND_THICK_MLP, KIND_THIN_MLP]
         self.config = config
         self.norm_in = nn.LayerNorm(config.dim_model)
         self.attn = BakaAttention(config)
         self.kind = kind
 
-        self.mlp = None if self.kind == BakaLayer.KIND_THIN else BakaMLP(config)
-        if self.kind == BakaLayer.KIND_THIN:
-            self.mlp = None
-            # Thin layer by default are next to zero
-            for p in self.attn.parameters():
-                p.data *= 0.0001
-        elif self.kind == BakaLayer.KIND_THICK_MLP:
+        if self.kind == KIND_THIN_MLP:
+            thin_config = dataclasses.replace(config, dim_ff=int(config.dim_ff*3/4))
+            self.mlp = BakaMLP(thin_config)
+        elif self.kind == KIND_THICK_MLP:
             thick_config = dataclasses.replace(config, dim_ff=config.dim_ff*2)
             self.mlp = BakaMLP(thick_config)
         else:
+            assert self.kind == KIND_NORMAL
             self.mlp = BakaMLP(config)
 
 
@@ -235,11 +235,7 @@ class BakaNet(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
-        
-        thick_layers = [BakaLayer(config, kind=BakaLayer.KIND_THICK_MLP) for _ in range(config.n_thick_layers)]
-        normal_layers = [BakaLayer(config, kind=BakaLayer.KIND_NORMAL) for _ in range(config.n_layers_normal)]
-        layers = thick_layers + normal_layers
-        self.layers = nn.ModuleList(layers)
+        self.layers = nn.ModuleList([BakaLayer(config, kind=kind) for kind in config.layer_types])
         self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
         # TODO: move pauses into its own module as rmt
         
