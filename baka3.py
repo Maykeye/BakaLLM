@@ -19,6 +19,11 @@ from rotary_embedding_torch import RotaryEmbedding
 import mmh3
 from bakadata import get_dl, get_tokenizer, batch_iterator, MiniBatch
 
+from float_logger import flog
+
+def my_log(**kwargs):
+    flog(**kwargs)
+    wandb_log(**kwargs)
 
 def model_numel(m: nn.Module):
     return sum(p.numel() for p in m.parameters())
@@ -34,6 +39,7 @@ class BakaState:
     input: Optional[Tensor] = None
     output: Optional[Tensor] = None
     offset: int = 0
+    past_state: Optional["BakaState"] = None  # if this is layer L at current chunk C, this field points to layer (L-1) in chunk (C-1)
     past_predcessor_state: Optional["BakaState"] = None  # if this is layer L at current chunk C, this field points to layer (L-1) in chunk (C-1)
     k_cache: Optional[Tensor] = None
     v_cache: Optional[Tensor] = None
@@ -246,7 +252,6 @@ class BakaRMT(nn.Module):
 
     def inject(self, current_start: BakaState, last_end: Optional[BakaState]) -> BakaRMTState:
         assert current_start.input is not None
-        rhs = self.rmt_tokens.repeat(current_start.n_batch, 1, 1)
 
         if last_end is not None:
             assert last_end.output is not None
@@ -259,10 +264,12 @@ class BakaRMT(nn.Module):
                 lhs = torch.cat((margin_lhs, lhs, margin_rhs))
 
             lhs = self.solidifier(lhs)
+            rhs = lhs
 
             current_start.input = torch.cat((lhs, current_start.input, rhs), 1)
             return BakaRMTState(lhs=lhs.shape[1] , rhs=rhs.shape[1])
         
+        rhs = self.rmt_tokens.repeat(current_start.n_batch, 1, 1)
         current_start.input = torch.cat((current_start.input, rhs), 1)
         return BakaRMTState(lhs=0, rhs=rhs.shape[1])
 
@@ -558,7 +565,7 @@ def main():
     def write_log(loss: Tensor, mb: MiniBatch):
         bar.set_description(f'L:{loss.item():.4f}, P:{mb.progress:%}x{mb.n_batch} (len:{mb.seqtotal})')
         if do_log:
-            wandb_log(loss=loss.item(), project=f"baka3-{project}", run_id=run_id)
+            my_log(loss=loss.item(), project=f"baka3-{project}", run_id=run_id)
 
     for i_batch, batch in enumerate(bar := tqdm(dl)):
         train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, 
