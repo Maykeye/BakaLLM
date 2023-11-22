@@ -132,6 +132,9 @@ class FloatLogger:
                     ib(k, v)
                 ib("session_id", self.session_id)
                 ib.insert(c)
+        self.connection.close()
+        assert self.project
+        self.connection = sqlite3.connect(self.project_path(self.project))
         self.buffer = []
 
     def __del__(self):

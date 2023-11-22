@@ -1,4 +1,5 @@
 import sys
+import numpy as np
 import optparse
 from tqdm.auto import tqdm
 import wandb
@@ -9,7 +10,7 @@ from typing import Tuple
 from torch import LongTensor, Tensor
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import einops, rearrange
+from einops import rearrange
 
 from dataclasses import dataclass
 import dataclasses
@@ -18,8 +19,8 @@ from typing import Optional
 from rotary_embedding_torch import RotaryEmbedding
 import mmh3
 from bakadata import get_dl, get_tokenizer, batch_iterator, MiniBatch
-
 from float_logger import flog
+from transformers import set_seed
 
 def my_log(**kwargs):
     flog(**kwargs)
@@ -71,9 +72,9 @@ class BakaConfig:
     n_ctx: int = 512
     n_pauses: int = 8
     is_pause_pos_random: bool = False
-    n_rmt_tokens: int = 16
+    n_rmt_tokens: int = 24
     n_rmt_margins: int = 0
-    rmt_solidifier: str = "none" # none, glu, layer, thinlayer
+    rmt_solidifier: str = "none" # none, glu, mlp, gelephant
     act_fn: str = "elephant"
     model_type = "baka_rmt"
 
@@ -118,9 +119,10 @@ class BakaMLP(nn.Module):
         self.fc_up = nn.Linear(config.dim_model, config.dim_ff, False)
         self.fc_down = nn.Linear(config.dim_ff, config.dim_model, False)
 
-    def forward(self, state: BakaState):
-        gate = self.act(self.fc_gate(state.input))
-        y = self.fc_up(state.input) * gate
+    def forward(self, state: BakaState|Tensor):
+        input = state.input if isinstance(state, BakaState) else state # TODO: is it cleaner to fix MLP to accept tensor only? meh
+        gate = self.act(self.fc_gate(input))
+        y = self.fc_up(input) * gate
         y = self.fc_down(y)
         return y
 
@@ -208,6 +210,10 @@ class BakaAttention(nn.Module):
         return q, k, v
 
 
+def make_post_normalized(n_dim: int, base: nn.Module):
+    return nn.Sequential(base, nn.LayerNorm(n_dim))
+
+
 class BakaLayer(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
@@ -217,37 +223,81 @@ class BakaLayer(nn.Module):
         self.mlp = BakaMLP(config)
 
     def forward(self, state: BakaState):
-        y = state.input
-        assert y is not None
+        x0 = state.input
+        assert x0 is not None
         state.input = self.norm_in(state.input)
         attn = self.attn(state)
         mlp = self.mlp(state)
-        y = y + attn + mlp
+        y = x0 + attn + mlp
         state.output = y
         return y
 
 
-class BakaGLU(nn.Module):
-    def __init__(self, config) -> None:
+class BakaGate(nn.Module):
+    def __init__(self, config: BakaConfig, act_fn_maker) -> None:
         super().__init__()
-        self.ff = nn.Linear(config.dim_model, config.dim_model)
-        self.ff_gate = nn.Linear(config.dim_model, config.dim_model)
+        self.config = config
+        self.ff = nn.Linear(config.dim_model, config.dim_model, False)
+        self.ff_gate = nn.Linear(config.dim_model, config.dim_model, False)
+        self.act_fn = act_fn_maker()
     def forward(self, x):
-        gate = self.ff_gate(x).sigmoid()
+        gate = self.act_fn(self.ff_gate(x))
         x = self.ff(x)
-        return x * gate
+        return x + x * gate
+
+
+def pseudo_eye_init_(data: Tensor | nn.Linear):
+    if isinstance(data, nn.Linear):
+        return pseudo_eye_init_(data.weight.data)
+    assert data.dim() == 2
+    assert data.shape[0] == data.shape[1]
+    data *= 0.01
+    data += torch.eye(data.shape[0])
+
+def scale_init_(data: Tensor | nn.Linear, s = 0.01):
+    if isinstance(data, nn.Linear):
+        return scale_init_(data.weight.data)
+    data *= 0.01
+
+    
+
+class BakaRmtSoldifier(nn.Module):
+    def __init__(self, config: BakaConfig):
+        super().__init__()
+        self.config = config
+        self.fc_seq = nn.Linear(config.dim_model, config.dim_model, bias=False)
+        self.fc_dim = nn.Linear(config.n_rmt_tokens, config.n_rmt_tokens, bias=False)
+        self.norm1 = nn.LayerNorm(config.dim_model)
+        self.norm2 = nn.LayerNorm(config.dim_model)
+        scale_init_(self.fc_seq)
+        scale_init_(self.fc_dim)
+
+    def forward(self, rmt: Tensor):
+        x0 = rmt
+        rmt = self.norm1(rmt).mT
+        rmt = self.fc_dim(rmt).mT
+        rmt = self.norm2(rmt)
+        rmt = self.fc_seq(rmt)
+        return rmt + x0
+
+
+
 
 class BakaRMT(nn.Module):
     def __init__(self, config: BakaConfig):
         super().__init__()
         self.config = config
         if self.config.rmt_solidifier == "none":
-            self.solidifier = nn.Identity()
+            mk_solidifier = nn.Identity
+        elif self.config.rmt_solidifier == "mlp":
+            mk_solidifier = lambda: BakaMLP(config)
         elif self.config.rmt_solidifier == "glu":
-            self.solidifier = BakaGLU(config)
+            mk_solidifier = lambda: BakaGate(config, nn.Sigmoid)
+        elif self.config.rmt_solidifier == "gelephant":
+            mk_solidifier = lambda: BakaGate(config, BakaElephant)
         else:
             raise ValueError(f"Unknown solidifier {self.config.rmt_solidifier}")
-
+        self.solidifier = mk_solidifier()
         self.rmt_tokens = nn.Parameter(torch.randn(config.n_rmt_tokens, config.dim_model))
 
     def inject(self, current_start: BakaState, last_end: Optional[BakaState]) -> BakaRMTState:
@@ -255,19 +305,12 @@ class BakaRMT(nn.Module):
 
         if last_end is not None:
             assert last_end.output is not None
-            n_margin = self.config.n_rmt_margins
-            lhs = last_end.output[:, -self.config.n_rmt_tokens:]
-            if n_margin:
-                lhs = lhs[:, n_margin:-n_margin]
-                margin_lhs = self.rmt_tokens[:n_margin].repeat(current_start.n_batch, 1, 1)
-                margin_rhs = self.rmt_tokens[-n_margin:].repeat(current_start.n_batch, 1, 1)
-                lhs = torch.cat((margin_lhs, lhs, margin_rhs))
-
-            lhs = self.solidifier(lhs)
-            rhs = lhs
-
+            assert last_end.rmt is not None
+            raw = last_end.output[:, -self.config.n_rmt_tokens:]
+            lhs = rhs = self.solidifier(raw)
+            lhs = rhs = raw
             current_start.input = torch.cat((lhs, current_start.input, rhs), 1)
-            return BakaRMTState(lhs=lhs.shape[1] , rhs=rhs.shape[1])
+            return BakaRMTState(lhs=lhs.shape[1], rhs=rhs.shape[1])
         
         rhs = self.rmt_tokens.repeat(current_start.n_batch, 1, 1)
         current_start.input = torch.cat((current_start.input, rhs), 1)
@@ -275,10 +318,15 @@ class BakaRMT(nn.Module):
 
     def detach(self, x: Tensor, state: BakaRMTState):
         if state.lhs:
-            x = x[:, self.config.n_rmt_tokens:]
+            x = x[:, state.lhs:]
         if state.rhs:
-            x = x[:, :-self.config.n_rmt_tokens]
+            x = x[:, :-state.rhs]
         return x
+
+
+
+
+
 
     
 
@@ -317,7 +365,6 @@ class BakaNet(nn.Module):
 
         # Prepare outputs for each chunk
         outputs = []
-
         # Move in context left to right
         for pos in range(0, n_seq, self.config.n_ctx):
             # Prepare this step state
@@ -354,7 +401,7 @@ class BakaNet(nn.Module):
             # Shift current states into old states
             old_states: list[BakaState] = states #type: ignore
 
-            # Detach older states
+            # Detach older states completely
             for state in old_states:
                 state.past_predcessor_state = None 
 
@@ -486,7 +533,24 @@ def propogate_past_states(past: Optional[list[BakaState]], mb: MiniBatch, detach
                 v = v.detach()
             setattr(state, k, v)
 
+def get_grad_norm(model):
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** (1. / 2)
+    return total_norm
 
+def autoclip_gradient(model: nn.Module, grad_history: list[float], clip_percentile: float=10.0):
+    obs_grad_norm = get_grad_norm(model)
+    grad_history.append(obs_grad_norm)
+    clip_value = np.percentile(grad_history, clip_percentile)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value) #type: ignore
+
+AUTOCLIP = "autoclip"
+DYNAMIC_AUTOCLIP="dynamic"
+AUTOCLIP_HISTORY=[]
 def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=0, detach_at = 0, write_log=None):
     past = None
 
@@ -501,7 +565,16 @@ def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_fi
         past = out.states
         loss = out.loss
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        if clip is not None:
+            if clip == AUTOCLIP:
+                autoclip_gradient(model, AUTOCLIP_HISTORY)
+            elif clip == DYNAMIC_AUTOCLIP:
+                clip_alpha = 0.5
+                clip_beta = 2 / torch.e
+                step_clip = clip_alpha * (mb.progress) + clip_beta * (1-mb.progress)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), step_clip) #type: ignore
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip) #type: ignore
         opt.step()
         opt.zero_grad()
         if write_log:
@@ -509,6 +582,7 @@ def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_fi
 
 
 def main():
+    set_seed(9)
     parser = optparse.OptionParser()
     parser.add_option("-p", "--project", dest="project",
                       help="set project name to PROJECT", metavar="PROJECT")
@@ -546,7 +620,10 @@ def main():
     assert run_id, "run id is required"
     tokenizer = get_tokenizer()
     dl = get_dl(tokenizer, batch_size=batch_size, n_skip_batches=options.skip)
-    clip = 1.0
+    
+    #clip = AUTOCLIP
+    clip = 2/torch.e
+
     #
     model = make_model(tokenizer)
     training_ctx_size = 2048
@@ -557,10 +634,20 @@ def main():
     model_path = gen_model_path(project, model)
     opt_path = model_path + ".opt"
     ###
-    print(f"#parms: {model_numel(model)}")
+    mean = 0
+    n_mean = 0
+    for p in model.parameters():
+        mean += p.mean()
+        n_mean += 1
+    mean /= n_mean
+
+    print(f"#parms: {model_numel(model)}; path: {model_path}; mean={mean}")
+
     if do_load:
         try_load(model, model_path)
         try_load(opt, opt_path)
+
+    
 
     def write_log(loss: Tensor, mb: MiniBatch):
         bar.set_description(f'L:{loss.item():.4f}, P:{mb.progress:%}x{mb.n_batch} (len:{mb.seqtotal})')
@@ -584,4 +671,5 @@ def main():
 
 
 if __name__ == "__main__":
+    #torch.use_deterministic_algorithms(True)
     main()
