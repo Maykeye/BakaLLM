@@ -19,7 +19,11 @@ from rotary_embedding_torch import RotaryEmbedding
 import mmh3
 from bakadata import get_dl, get_tokenizer, batch_iterator, MiniBatch
 from transformers import set_seed
+from float_logger import flog
 
+def my_log(**kwargs):
+    flog(**kwargs)
+    wandb_log(**kwargs)
 
 def model_numel(m: nn.Module):
     return sum(p.numel() for p in m.parameters())
@@ -491,7 +495,7 @@ def main():
     def write_log(loss: Tensor, mb: MiniBatch):
         bar.set_description(f'L:{loss.item():.4f}, P:{mb.progress:%}x{mb.n_batch} (len:{mb.seqtotal})')
         if do_log:
-            wandb_log(loss=loss.item(), project=f"baka3-{project}", run_id=run_id)
+            my_log(loss=loss.item(), project=f"baka3-{project}", run_id=run_id)
 
     for i_batch, batch in enumerate(bar := tqdm(dl)):
         train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, write_log=write_log)
