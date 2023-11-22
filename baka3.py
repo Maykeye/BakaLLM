@@ -18,6 +18,7 @@ from typing import Optional
 from rotary_embedding_torch import RotaryEmbedding
 import mmh3
 from bakadata import get_dl, get_tokenizer, batch_iterator, MiniBatch
+from transformers import set_seed
 
 
 def model_numel(m: nn.Module):
@@ -435,6 +436,7 @@ def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_fi
 
 
 def main():
+    set_seed(9)
     parser = optparse.OptionParser()
     parser.add_option("-p", "--project", dest="project",
                       help="set project name to PROJECT", metavar="PROJECT")
