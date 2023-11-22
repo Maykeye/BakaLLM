@@ -408,7 +408,7 @@ def gen_model_path(project, model):
     return model_path
 
 
-def propogate_past_states(past: list[BakaState], mb: MiniBatch):
+def propogate_past_states(past: list[BakaState]|None, mb: MiniBatch):
     if not past:
         return
     keys = list(dataclasses.asdict(BakaState()).keys())
@@ -432,7 +432,7 @@ def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_fi
         past = out.states
         loss = out.loss
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip) # type: ignore
         opt.step()
         opt.zero_grad()
         if write_log:
