@@ -68,7 +68,7 @@ class BakaConfig:
     is_pause_pos_random: bool = False
 
     act_fn: str = "elephant"
-    model_type = "baka_pause"
+    model_type = "baka_steps"
 
     def __post_init__(self):
         self.dim_ff = self.dim_ff or self.dim_model * 4
@@ -214,6 +214,7 @@ class BakaLayer(nn.Module):
         self.norm_in = BakaRMSNorm(config.dim_model)
         self.attn = BakaAttention(config)
         self.mlp = BakaMLP(config)
+        self.step_forward = BakaStepForward(config)
 
     def forward(self, state: BakaState):
         y = state.input
@@ -221,7 +222,7 @@ class BakaLayer(nn.Module):
         state.input = self.norm_in(state.input)
         attn = self.attn(state)
         mlp = self.mlp(state)
-        y = y + attn + mlp
+        y = y + attn + mlp + self.step_forward(state.input)
         state.output = y
         return y
 
@@ -254,6 +255,31 @@ class BakaPause(nn.Module):
             x = torch.cat((x[:, :pos], x[:, pos+1:]), 1)
         return x
 
+class BakaStepForward(nn.Module):
+    def __init__(self, config: BakaConfig) -> None:
+        super().__init__()
+        self.config = config
+        # TODO: multiscale (2*head? 4*head?)
+        # TODO: configure through config
+        self.n_steps = 4
+        self.step = nn.Linear(config.dim_model * self.n_steps, config.dim_model, False)
+        # TODO: start near zero
+
+    def forward(self, raw: Tensor):
+        raw_n_seq = raw.shape[1]
+        x = raw[:, raw_n_seq % 4:]
+        n_seq = x.shape[1]
+        if n_seq:
+            widened = rearrange(x, "b (t q) c -> b t (q c)", q = self.n_steps)
+            stepped = self.step(widened)
+            y = rearrange(torch.zeros_like(x), "b (t q) c -> b t q c", q = self.n_steps)
+            y[:, :, -1] += stepped
+            y = rearrange(y, "b t q c -> b (t q) c")
+            if raw_n_seq > n_seq:
+                left_padding = torch.zeros_like(raw[:, :raw_n_seq - n_seq])
+                y = torch.cat((left_padding, y), -2)
+            return y
+        return torch.zeros_like(raw)
 
 class BakaNet(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
@@ -292,7 +318,8 @@ class BakaNet(nn.Module):
             states = [BakaState(input=None, offset=start_pos + pos) for _ in range(self.config.n_layers)]
 
             # pass input from the current context window
-            states[0].input = input[:, pos:pos+self.config.n_ctx, :]
+            raw_input = input[:, pos:pos+self.config.n_ctx, :]
+            states[0].input = raw_input
             self.pause.inject(states[0])
 
             # Move in the model top to bottom
@@ -476,7 +503,7 @@ def main():
     assert run_id, "run id is required"
     tokenizer = get_tokenizer()
     dl = get_dl(tokenizer, batch_size=batch_size, n_skip_batches=options.skip)
-    clip = 1.0
+    clip = 0.5
     #
     model = make_model(tokenizer)
     training_ctx_size = 2048
@@ -487,7 +514,7 @@ def main():
     model_path = gen_model_path(project, model)
     opt_path = model_path + ".opt"
     ###
-    print(f"#parms: {model_numel(model)}")
+    print(f"#parms: {model_numel(model)} path: {model_path}")
     if do_load:
         try_load(model, model_path)
         try_load(opt, opt_path)
