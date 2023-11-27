@@ -82,6 +82,7 @@ def load_baka_pythia():
 @torch.no_grad()
 def run(ctx: TestContext):
     dl = get_dl(ctx.tokenizer, batch_size=ctx.n_batch, split="validation")
+    ctx.model.eval() 
     losses = []
     nans = 0
     for b in tqdm(dl):

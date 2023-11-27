@@ -266,6 +266,22 @@ class BakaStepForward(nn.Module):
         # TODO: start near zero
 
     def forward(self, raw: Tensor):
+        n_seq = raw.shape[1]
+        if n_seq < self.n_steps:
+            return torch.zeros_like(raw)
+
+        result = torch.zeros_like(raw)
+        
+        for substep in range(self.n_steps):
+            step_input = raw[:, :-substep] if substep else raw
+            out = self.raw_forward(step_input)
+            right_pad = torch.zeros_like(raw[:, :substep])
+            padded = torch.cat((out, right_pad), 1)
+            result = result + padded
+
+        return result
+
+    def raw_forward(self, raw: Tensor):
         raw_n_seq = raw.shape[1]
         x = raw[:, raw_n_seq % 4:]
         n_seq = x.shape[1]
@@ -461,10 +477,34 @@ def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_fi
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), clip) # type: ignore
         opt.step()
-        opt.zero_grad()
+        opt.zero_grad(True)
         if write_log:
             write_log(loss, mb)
 
+def focus_training(model: BakaNetCausalLM):
+    return
+    model.requires_grad_(False)
+    if False:
+        print("*** Focus: Attention")
+        for layer in model.model.layers:
+            layer.attn.requires_grad_(True)
+            layer.attn.rot.requires_grad_(False) # Doesn't work if rot requires_grad_
+
+    if True:
+        print("*** Focus: MLP")
+        for layer in model.model.layers:
+            layer.mlp.requires_grad_(True)
+
+    if False:
+        print("*** Focus: step forward")
+        for layer in model.model.layers:
+            layer.step_forward.requires_grad_(True)
+
+    if True:
+        print("*** Focus: layer norms")
+        for layer in model.model.layers:
+            layer.norm_in.requires_grad_(True)
+        model.norm_out.requires_grad_(True)
 
 def main():
     set_seed(9)
@@ -524,6 +564,7 @@ def main():
         if do_log:
             my_log(loss=loss.item(), project=f"baka3-{project}", run_id=run_id)
 
+    focus_training(model)
     for i_batch, batch in enumerate(bar := tqdm(dl)):
         train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, write_log=write_log)
         train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=n_ctx//2, write_log=write_log)
