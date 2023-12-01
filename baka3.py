@@ -206,54 +206,25 @@ class BakaAttention(nn.Module):
 
         return q, k, v
 
-
-class BakaLayer(nn.Module):
-    def __init__(self, config: BakaConfig) -> None:
+class BakaGated(nn.Module):
+    def __init__(self, base) -> None:
         super().__init__()
-        self.config = config
-        self.norm_in = BakaRMSNorm(config.dim_model)
-        self.attn = BakaAttention(config)
-        self.mlp = BakaMLP(config)
-        self.step_forward = BakaStepForward(config)
+        self.base = base
+        self.config = base.config
+        self.fc_gate = nn.Linear(self.config.dim_model, self.config.dim_model, False)
+        self.fn_gate = nn.ReLU()
 
-    def forward(self, state: BakaState):
-        y = state.input
-        assert y is not None
-        state.input = self.norm_in(state.input)
-        attn = self.attn(state)
-        mlp = self.mlp(state)
-        y = y + attn + mlp + self.step_forward(state.input)
-        state.output = y
-        return y
-
-class BakaPause(nn.Module):
-    def __init__(self, config: BakaConfig) -> None:
-        super().__init__()
-        self.config = config
-        self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
-
-    def inject(self, state:BakaState):
-        assert state.input is not None
-        def rand_pos(n) -> int:
-            return int(torch.randint(1, n+1, (1,)).item())
-
-        # first pos is fixed to zero to emulate BOS
-        if self.config.is_pause_pos_random:
-            state.pauses_pos = [0] + [rand_pos(state.n_seq + i) for i in range(1, self.config.n_pauses)]
-        else:
-            step = self.config.n_ctx // (self.config.n_pauses)
-            state.pauses_pos = [step * i for i in range(self.config.n_pauses) if step*i <= state.n_seq]
-
-        pause_emb = self.pause_emb.repeat(state.n_batch, 1, 1)
-        x = state.input
-        for pos in state.pauses_pos:
-            x = torch.cat((x[:, :pos], pause_emb, x[:, pos:]), 1)
-        state.input = x
-
-    def removed(self, x: Tensor, pauses_pos: list[int]):
-        for pos in reversed(pauses_pos):
-            x = torch.cat((x[:, :pos], x[:, pos+1:]), 1)
-        return x
+    def forward(self, input: BakaState | Tensor):
+        y = self.base(input)
+        if isinstance(input, BakaState):
+            assert input.input is not None
+            input = input.input
+        # TODO: sigmoid(x) -- worse, but start is much better
+        # TODO: sigmoid(y) -- completely worse
+        # TODO: relu(x) -- better in E1
+        # TODO: replace sigmoid with something other(lerelu?)
+        gate = self.fn_gate(self.fc_gate(input))
+        return y * gate
 
 class BakaStepForward(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
@@ -297,11 +268,69 @@ class BakaStepForward(nn.Module):
             return y
         return torch.zeros_like(raw)
 
+class BakaLayer(nn.Module):
+    def __init__(self, config: BakaConfig, step_forward_source: Optional[BakaStepForward]=None) -> None:
+        super().__init__()
+        assert step_forward_source is None or isinstance(step_forward_source, BakaStepForward)
+        self.config = config
+        self.norm_in = BakaRMSNorm(config.dim_model)
+        self.attn = BakaGated(BakaAttention(config))
+        self.mlp = BakaGated(BakaMLP(config))
+        self.step_forward = BakaGated(step_forward_source or BakaStepForward(config))
+
+
+
+    def forward(self, state: BakaState):
+        y = state.input
+        assert y is not None
+        state.input = self.norm_in(state.input)
+        attn = self.attn(state)
+        mlp = self.mlp(state)
+        y = y + attn + mlp + self.step_forward(state.input)
+        state.output = y
+        return y
+
+class BakaPause(nn.Module):
+    def __init__(self, config: BakaConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
+
+    def inject(self, state:BakaState):
+        assert state.input is not None
+        def rand_pos(n) -> int:
+            return int(torch.randint(1, n+1, (1,)).item())
+
+        # first pos is fixed to zero to emulate BOS
+        if self.config.is_pause_pos_random:
+            state.pauses_pos = [0] + [rand_pos(state.n_seq + i) for i in range(1, self.config.n_pauses)]
+        else:
+            step = self.config.n_ctx // (self.config.n_pauses)
+            state.pauses_pos = [step * i for i in range(self.config.n_pauses) if step*i <= state.n_seq]
+
+        pause_emb = self.pause_emb.repeat(state.n_batch, 1, 1)
+        x = state.input
+        for pos in state.pauses_pos:
+            x = torch.cat((x[:, :pos], pause_emb, x[:, pos:]), 1)
+        state.input = x
+
+    def removed(self, x: Tensor, pauses_pos: list[int]):
+        for pos in reversed(pauses_pos):
+            x = torch.cat((x[:, :pos], x[:, pos+1:]), 1)
+        return x
+
+
 class BakaNet(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
-        self.layers = nn.ModuleList([BakaLayer(config) for _ in range(config.n_layers)])
+
+        layers: list[BakaLayer] = []
+        for i in range(config.n_layers):
+            reuse_step = None #= layers[-1].step_forward.base if i % 2 == 1 else None
+            layer = BakaLayer(config, reuse_step)
+            layers.append(layer)
+        self.layers = nn.ModuleList(layers)
         self.pause = BakaPause(config)
 
     def forward(self,
