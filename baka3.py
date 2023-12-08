@@ -233,71 +233,10 @@ class BakaLayer(nn.Module):
         return y
 
 
-class BakaGate(nn.Module):
-    def __init__(self, config: BakaConfig, act_fn_maker) -> None:
-        super().__init__()
-        self.config = config
-        self.ff = nn.Linear(config.dim_model, config.dim_model, False)
-        self.ff_gate = nn.Linear(config.dim_model, config.dim_model, False)
-        self.act_fn = act_fn_maker()
-    def forward(self, x):
-        gate = self.act_fn(self.ff_gate(x))
-        x = self.ff(x)
-        return x + x * gate
-
-
-def pseudo_eye_init_(data: Tensor | nn.Linear):
-    if isinstance(data, nn.Linear):
-        return pseudo_eye_init_(data.weight.data)
-    assert data.dim() == 2
-    assert data.shape[0] == data.shape[1]
-    data *= 0.01
-    data += torch.eye(data.shape[0])
-
-def scale_init_(data: Tensor | nn.Linear, s = 0.01):
-    if isinstance(data, nn.Linear):
-        return scale_init_(data.weight.data)
-    data *= 0.01
-
-    
-
-class BakaRmtSoldifier(nn.Module):
-    def __init__(self, config: BakaConfig):
-        super().__init__()
-        self.config = config
-        self.fc_seq = nn.Linear(config.dim_model, config.dim_model, bias=False)
-        self.fc_dim = nn.Linear(config.n_rmt_tokens, config.n_rmt_tokens, bias=False)
-        self.norm1 = nn.LayerNorm(config.dim_model)
-        self.norm2 = nn.LayerNorm(config.dim_model)
-        scale_init_(self.fc_seq)
-        scale_init_(self.fc_dim)
-
-    def forward(self, rmt: Tensor):
-        x0 = rmt
-        rmt = self.norm1(rmt).mT
-        rmt = self.fc_dim(rmt).mT
-        rmt = self.norm2(rmt)
-        rmt = self.fc_seq(rmt)
-        return rmt + x0
-
-
-
-
 class BakaRMT(nn.Module):
     def __init__(self, config: BakaConfig):
         super().__init__()
         self.config = config
-        if self.config.rmt_solidifier == "none":
-            mk_solidifier = nn.Identity
-        elif self.config.rmt_solidifier == "mlp":
-            mk_solidifier = lambda: BakaMLP(config)
-        elif self.config.rmt_solidifier == "glu":
-            mk_solidifier = lambda: BakaGate(config, nn.Sigmoid)
-        elif self.config.rmt_solidifier == "gelephant":
-            mk_solidifier = lambda: BakaGate(config, BakaElephant)
-        else:
-            raise ValueError(f"Unknown solidifier {self.config.rmt_solidifier}")
-        self.solidifier = mk_solidifier()
         self.rmt_tokens = nn.Parameter(torch.randn(config.n_rmt_tokens, config.dim_model))
 
     def inject(self, current_start: BakaState, last_end: Optional[BakaState]) -> BakaRMTState:
@@ -307,7 +246,6 @@ class BakaRMT(nn.Module):
             assert last_end.output is not None
             assert last_end.rmt is not None
             raw = last_end.output[:, -self.config.n_rmt_tokens:]
-            lhs = rhs = self.solidifier(raw)
             lhs = rhs = raw
             current_start.input = torch.cat((lhs, current_start.input, rhs), 1)
             return BakaRMTState(lhs=lhs.shape[1], rhs=rhs.shape[1])
