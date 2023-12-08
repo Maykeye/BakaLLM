@@ -61,7 +61,9 @@ class FloatLogger:
         self.connection = sqlite3.connect(self.project_path(project))
         self.session_id = self.gen_session()
         self.gen_data()
-        print(f"Flogger session id: {self.session_id}, db: {os.path.realpath(self.project_path(project))}")
+        hl_color = "\x1b[1;32m"
+        reset_color = "\x1b[0m"
+        print(f"Flogger session id: {hl_color}{self.session_id}{reset_color}, db: {hl_color}{os.path.realpath(self.project_path(project))}{reset_color}")
 
     def gen_data(self):
         assert self.connection, "Not connected to project"

@@ -72,7 +72,7 @@ class BakaConfig:
     n_ctx: int = 512
     n_pauses: int = 8
     is_pause_pos_random: bool = False
-    n_rmt_tokens: int = 24
+    n_rmt_tokens: int = 16
     n_rmt_margins: int = 0
     rmt_solidifier: str = "none" # none, glu, mlp, gelephant
     act_fn: str = "elephant"
@@ -245,8 +245,7 @@ class BakaRMT(nn.Module):
         if last_end is not None:
             assert last_end.output is not None
             assert last_end.rmt is not None
-            raw = last_end.output[:, -self.config.n_rmt_tokens:]
-            lhs = rhs = raw
+            lhs = rhs = last_end.output[:, -last_end.rmt.rhs:]
             current_start.input = torch.cat((lhs, current_start.input, rhs), 1)
             return BakaRMTState(lhs=lhs.shape[1], rhs=rhs.shape[1])
         
@@ -262,12 +261,34 @@ class BakaRMT(nn.Module):
         return x
 
 
+class BakaPause(nn.Module):
+    def __init__(self, config: BakaConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
 
+    def inject(self, state:BakaState):
+        assert state.input is not None
+        def rand_pos(n) -> int:
+            return int(torch.randint(1, n+1, (1,)).item())
 
+        # first pos is fixed to zero to emulate BOS
+        if self.config.is_pause_pos_random:
+            state.pauses_pos = [0] + [rand_pos(state.n_seq + i) for i in range(1, self.config.n_pauses)]
+        else:
+            step = self.config.n_ctx // (self.config.n_pauses)
+            state.pauses_pos = [step * i for i in range(self.config.n_pauses) if step*i <= state.n_seq]
 
+        pause_emb = self.pause_emb.repeat(state.n_batch, 1, 1)
+        x = state.input
+        for pos in state.pauses_pos:
+            x = torch.cat((x[:, :pos], pause_emb, x[:, pos:]), 1)
+        state.input = x
 
-    
-
+    def removed(self, x: Tensor, pauses_pos: list[int]):
+        for pos in reversed(pauses_pos):
+            x = torch.cat((x[:, :pos], x[:, pos+1:]), 1)
+        return x
 
 
 class BakaNet(nn.Module):
@@ -275,16 +296,13 @@ class BakaNet(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList([BakaLayer(config) for _ in range(config.n_layers)])
-        self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
+        self.pause = BakaPause(config)
         self.rmt = BakaRMT(config)
-        # TODO: move pauses into its own module as rmt
-        
 
     def forward(self, 
                 input: Tensor, 
                 old_states: Optional[list[Optional[BakaState]]] = None # type: ignore
         ) -> Tuple[Tensor, list[BakaState]]:
-        # TODO output_states flag
 
         n_batch, n_seq, n_dim = input.shape
         # Del unused vars to calm down my editor's LSP
@@ -310,7 +328,7 @@ class BakaNet(nn.Module):
 
             # pass input from the current context window
             states[0].input = input[:, pos:pos+self.config.n_ctx, :]
-            self.inject_pauses(states[0])
+            self.pause.inject(states[0])
             rmt_state = self.rmt.inject(states[0], old_states[-1])
             states[0].rmt = rmt_state
 
@@ -333,7 +351,7 @@ class BakaNet(nn.Module):
             # Last layer represents everything we know so far, which is more than necessary
             # To get output, useable for loss calc, we need to remove pauses, RMT, etc
             output = self.rmt.detach(states[-1].output, rmt_state)
-            output = self.output_without_pauses(output, states[-1].pauses_pos)
+            output = self.pause.removed(output, states[-1].pauses_pos)
             outputs.append(output)
 
             # Shift current states into old states
@@ -346,29 +364,6 @@ class BakaNet(nn.Module):
         outputs = torch.cat(outputs, 1)
         return outputs, old_states or [] # type: ignore
 
-
-    def inject_pauses(self, state:BakaState):
-        assert state.input is not None
-        def rand_pos(n) -> int:
-            return int(torch.randint(1, n+1, (1,)).item())
-        
-        # first pos is fixed to zero to emulate BOS
-        if self.config.is_pause_pos_random:
-            state.pauses_pos = [0] + [rand_pos(state.n_seq + i) for i in range(1, self.config.n_pauses)]
-        else:
-            step = self.config.n_ctx // (1+self.config.n_pauses)
-            state.pauses_pos = [step * i for i in range(self.config.n_pauses) if step*i <= state.n_seq]
-
-        pause_emb = self.pause_emb.repeat(state.n_batch, 1, 1)
-        x = state.input
-        for pos in state.pauses_pos:
-            x = torch.cat((x[:, :pos], pause_emb, x[:, pos:]), 1)
-        state.input = x
-
-    def output_without_pauses(self, x: Tensor, pauses_pos: list[int]):
-        for pos in reversed(pauses_pos):
-            x = torch.cat((x[:, :pos], x[:, pos+1:]), 1)
-        return x
 
 @dataclass
 class BakaCausalLMOutput:
@@ -387,7 +382,7 @@ class BakaNetCausalLM(nn.Module):
         self.vocab_out = nn.Linear(config.dim_model, config.n_vocab, False)
 
         # HF compatibility hack
-        self.model.get_input_embeddings = lambda: self.vocab_in
+        self.model.get_input_embeddings = lambda: self.vocab_in # type: ignore
 
     def forward(self,
                 input_ids: LongTensor,
@@ -559,10 +554,8 @@ def main():
     tokenizer = get_tokenizer()
     dl = get_dl(tokenizer, batch_size=batch_size, n_skip_batches=options.skip)
     
-    #clip = AUTOCLIP
-    clip = 2/torch.e
+    clip = 0.5
 
-    #
     model = make_model(tokenizer)
     training_ctx_size = 2048
     n_ctx = model.config.n_ctx
@@ -572,14 +565,9 @@ def main():
     model_path = gen_model_path(project, model)
     opt_path = model_path + ".opt"
     ###
-    mean = 0
-    n_mean = 0
-    for p in model.parameters():
-        mean += p.mean()
-        n_mean += 1
-    mean /= n_mean
-
-    print(f"#parms: {model_numel(model)}; path: {model_path}; mean={mean}")
+    hl_color = "\x1b[1;32m"
+    reset_color = "\x1b[0m"
+    print(f"#parms: {hl_color}{model_numel(model)}{reset_color}; path: {hl_color}{model_path}{reset_color}")
 
     if do_load:
         try_load(model, model_path)
