@@ -171,7 +171,7 @@ class BakaAttention(nn.Module):
                 mask[-state.rmt.rhs:] = 1
             if state.rmt.lhs:
                 # Read RMT memory applies to itself, but not current block unlike the paper["Additionally, we allow all
-                # memory tokens in the read/write block to access all other tokens in the same block. "]: 
+                # memory tokens in the read/write block to access all other tokens in the same block. "]:
                 # If model learns top copy first N tokens into first N tokens of RMT-Read, during PPL calculation of these first N tokens, it can easily
                 # cheat and read them, which will be a disaster during the inference
                 # TODO: can be optimized by fusing it into tril_ above
@@ -248,7 +248,7 @@ class BakaRMT(nn.Module):
             lhs = rhs = last_end.output[:, -last_end.rmt.rhs:]
             current_start.input = torch.cat((lhs, current_start.input, rhs), 1)
             return BakaRMTState(lhs=lhs.shape[1], rhs=rhs.shape[1])
-        
+
         rhs = self.rmt_tokens.repeat(current_start.n_batch, 1, 1)
         current_start.input = torch.cat((current_start.input, rhs), 1)
         return BakaRMTState(lhs=0, rhs=rhs.shape[1])
@@ -299,8 +299,8 @@ class BakaNet(nn.Module):
         self.pause = BakaPause(config)
         self.rmt = BakaRMT(config)
 
-    def forward(self, 
-                input: Tensor, 
+    def forward(self,
+                input: Tensor,
                 old_states: Optional[list[Optional[BakaState]]] = None # type: ignore
         ) -> Tuple[Tensor, list[BakaState]]:
 
@@ -359,7 +359,7 @@ class BakaNet(nn.Module):
 
             # Detach older states completely
             for state in old_states:
-                state.past_predcessor_state = None 
+                state.past_predcessor_state = None
 
         outputs = torch.cat(outputs, 1)
         return outputs, old_states or [] # type: ignore
@@ -487,10 +487,10 @@ AUTOCLIP_HISTORY=[]
 def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=0, detach_at = 0, write_log=None):
     past = None
 
-    for i, mb in enumerate(batch_iterator(batch, 
-                                          n_ctx=training_ctx_size, 
-                                          n_stride=training_ctx_size, 
-                                          tokenizer=tokenizer, 
+    for i, mb in enumerate(batch_iterator(batch,
+                                          n_ctx=training_ctx_size,
+                                          n_stride=training_ctx_size,
+                                          tokenizer=tokenizer,
                                           n_skip_first=n_skip_first)):
         should_detach = detach_at != 0 and i % detach_at == 0
         past = propogate_past_states(past, mb, detach=should_detach)
@@ -553,7 +553,7 @@ def main():
     assert run_id, "run id is required"
     tokenizer = get_tokenizer()
     dl = get_dl(tokenizer, batch_size=batch_size, n_skip_batches=options.skip)
-    
+
     clip = 0.5
 
     model = make_model(tokenizer)
@@ -573,7 +573,7 @@ def main():
         try_load(model, model_path)
         try_load(opt, opt_path)
 
-    
+
 
     def write_log(loss: Tensor, mb: MiniBatch):
         bar.set_description(f'L:{loss.item():.4f}, P:{mb.progress:%}x{mb.n_batch} (len:{mb.seqtotal})')
@@ -581,9 +581,9 @@ def main():
             my_log(loss=loss.item(), project=f"baka3-{project}", run_id=run_id)
 
     for i_batch, batch in enumerate(bar := tqdm(dl)):
-        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, 
+        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip,
                     n_skip_first=0, detach_at=detach_at, write_log=write_log)
-        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, 
+        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip,
                     n_skip_first=n_ctx//2, detach_at=detach_at, write_log=write_log)
 
         if do_save and i_batch and i_batch % 50 == 0:
