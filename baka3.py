@@ -22,6 +22,8 @@ from bakadata import get_dl, get_tokenizer, batch_iterator, MiniBatch
 from float_logger import flog
 from transformers import set_seed
 
+import flash_attn
+
 def my_log(**kwargs):
     flog(**kwargs)
     wandb_log(**kwargs)
@@ -77,6 +79,7 @@ class BakaConfig:
     rmt_solidifier: str = "none" # none, glu, mlp, gelephant
     act_fn: str = "elephant"
     model_type = "baka_rmt"
+    use_flash_attn: bool = True
 
     def __post_init__(self):
         self.dim_ff = self.dim_ff or self.dim_model * 4
@@ -139,9 +142,18 @@ class BakaAttention(nn.Module):
 
     def forward(self, state: BakaState):
         q, k, v = self.build_qkv(state)
-        is_causal, attn_mask = self.build_attn_mask(state)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, attn_mask=attn_mask)
-        y = rearrange(y, "b h t f -> b t (h f)")
+        if self.config.use_flash_attn:
+            # NB: Flash attention ignores RMT mask
+            y = flash_attn.flash_attn_func(q, k, v, causal=True) 
+        else:
+            is_causal, attn_mask = self.build_attn_mask(state)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, attn_mask=attn_mask)
+
+
+        arrangement = "b t h f" if self.config.use_flash_attn else "b h t f"
+        arrangement += " -> b t (h f)"
+
+        y = rearrange(y, arrangement)
         y = self.o(y)
         return y
 
@@ -157,7 +169,7 @@ class BakaAttention(nn.Module):
 
         # Build a matrix for both past and present
         # 1 1 1 1  1 1 1
-        # 1 1 1 1  1 1 1
+        # 1 1 1 1  1 1  
         # 1 1 1 1  1 1 1
         mask = torch.ones(now_n_seq, now_n_seq + past_n_seq, dtype=torch.bool, device=state.device)
         # by shifting diagonal we can cut from current chunk only
@@ -185,9 +197,12 @@ class BakaAttention(nn.Module):
         k = self.k(state.input)
         v = self.v(state.input)
 
-        q = rearrange(q, "b t (h f) -> b h t f", h=self.config.n_heads)
-        k = rearrange(k, "b t (h f) -> b h t f", h=self.config.n_heads)
-        v = rearrange(v, "b t (h f) -> b h t f", h=self.config.n_heads)
+        arrangement = "b t (h f) -> "
+        arrangement += "b t h f" if self.config.use_flash_attn else "b h t f"
+
+        q = rearrange(q, arrangement, h=self.config.n_heads)
+        k = rearrange(k, arrangement, h=self.config.n_heads)
+        v = rearrange(v, arrangement, h=self.config.n_heads)
 
         # Cache keys without rotating (temporary?)
         state.k_cache = k
@@ -200,12 +215,13 @@ class BakaAttention(nn.Module):
             past_k = past.k_cache
             past_v = past.v_cache
             assert past_k is not None and past_v is not None
-            k = torch.cat((past_k, k), -2)
-            v = torch.cat((past_v, v), -2)
+            seq_dim = -3 if self.config.use_flash_attn else -3
+            k = torch.cat((past_k, k), seq_dim)
+            v = torch.cat((past_v, v), seq_dim)
             current_offset = past.n_seq
-
-        q = self.rot.rotate_queries_or_keys(q, -2, offset=current_offset)
-        k = self.rot.rotate_queries_or_keys(k, -2, offset=past_offset)
+        seq_dim = -3 if self.config.use_flash_attn else -2
+        q = self.rot.rotate_queries_or_keys(q, seq_dim, offset=current_offset)
+        k = self.rot.rotate_queries_or_keys(k, seq_dim, offset=past_offset)
 
         return q, k, v
 
