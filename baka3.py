@@ -67,6 +67,7 @@ class BakaState:
 class BakaConfig:
     dim_model: int = 1024
     dim_ff: int = 0
+    ff_pattern = 'aaaabbbbcccc'
     dim_attn: int = 0
     n_layers: int = 12
     n_heads: int = 4
@@ -78,10 +79,12 @@ class BakaConfig:
     n_rmt_margins: int = 0
     rmt_solidifier: str = "none" # none, glu, mlp, gelephant
     act_fn: str = "elephant"
-    model_type = "baka_rmt"
+    model_type = "baka_shared_mlp"
     use_flash_attn: bool = True
 
     def __post_init__(self):
+        if self.dim_ff == 0 and self.ff_pattern:
+            self.dim_ff = self.dim_model * 4 * len(set(self.ff_pattern))
         self.dim_ff = self.dim_ff or self.dim_model * 4
         self.dim_attn = self.dim_attn or self.dim_model
         assert self.dim_attn % self.n_heads == 0
@@ -114,13 +117,14 @@ def make_activation_fn(s):
 
 
 class BakaMLP(nn.Module):
-    def __init__(self, config: BakaConfig) -> None:
+    def __init__(self, config: BakaConfig, name=None) -> None:
         super().__init__()
         self.config = config
         self.act = make_activation_fn(self.config.act_fn)
         self.fc_gate = nn.Linear(config.dim_model, config.dim_ff, False)
         self.fc_up = nn.Linear(config.dim_model, config.dim_ff, False)
         self.fc_down = nn.Linear(config.dim_ff, config.dim_model, False)
+        self.name = name
 
     def forward(self, state: BakaState|Tensor):
         input = state.input if isinstance(state, BakaState) else state # TODO: is it cleaner to fix MLP to accept tensor only? meh
@@ -128,6 +132,10 @@ class BakaMLP(nn.Module):
         y = self.fc_up(input) * gate
         y = self.fc_down(y)
         return y
+
+    def extra_repr(self) -> str:
+        name = self.name or hex(id(self))
+        return f'name={name!r}'
 
 
 class BakaAttention(nn.Module):
@@ -231,12 +239,12 @@ def make_post_normalized(n_dim: int, base: nn.Module):
 
 
 class BakaLayer(nn.Module):
-    def __init__(self, config: BakaConfig) -> None:
+    def __init__(self, config: BakaConfig, *, reused_mlp: Optional[BakaMLP], name=None) -> None:
         super().__init__()
         self.config = config
         self.norm_in = nn.LayerNorm(config.dim_model)
         self.attn = BakaAttention(config)
-        self.mlp = BakaMLP(config)
+        self.mlp = reused_mlp or BakaMLP(config, name=f'ff_{name}')
 
     def forward(self, state: BakaState):
         x0 = state.input
@@ -311,7 +319,15 @@ class BakaNet(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
-        self.layers = nn.ModuleList([BakaLayer(config) for _ in range(config.n_layers)])
+        layers = []
+        shared_mlps = {}
+        for i in range(config.n_layers):
+            ff_key = config.ff_pattern[i]
+            layer = BakaLayer(config, reused_mlp=shared_mlps.get(ff_key), name=ff_key)
+            shared_mlps[ff_key] = layer.mlp
+            layers.append(layer)
+
+        self.layers = nn.ModuleList(layers)
         self.pause = BakaPause(config)
         self.rmt = BakaRMT(config)
 
@@ -449,7 +465,7 @@ def try_load(obj, path):
 def make_model(tokenizer) -> BakaNetCausalLM:
     cfg = BakaConfig(
         dim_model=768,
-        dim_ff=3072,
+        dim_ff=3072, #TODO: remove me
         n_heads=12,
         n_layers=12,
         n_vocab=len(tokenizer))
