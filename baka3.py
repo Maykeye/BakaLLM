@@ -83,6 +83,8 @@ class BakaConfig:
     use_flash_attn: bool = True
 
     def __post_init__(self):
+        if self.ff_pattern:
+            assert len(self.ff_pattern) == self.n_layers
         if self.dim_ff == 0 and self.ff_pattern:
             self.dim_ff = self.dim_model * 4 * len(set(self.ff_pattern))
         self.dim_ff = self.dim_ff or self.dim_model * 4
@@ -465,7 +467,7 @@ def try_load(obj, path):
 def make_model(tokenizer) -> BakaNetCausalLM:
     cfg = BakaConfig(
         dim_model=768,
-        dim_ff=3072, #TODO: remove me
+        dim_ff=3072*2, #TODO: remove me
         n_heads=12,
         n_layers=12,
         n_vocab=len(tokenizer))
