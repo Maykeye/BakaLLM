@@ -95,6 +95,13 @@ class BakaConfig:
     def dim_head(self):
         return self.dim_attn // self.n_heads
 
+def make_config(tokenizer):
+    return BakaConfig(
+        dim_model=768,
+        dim_ff=3072*2, #TODO: remove me
+        n_heads=12,
+        n_layers=12,
+        n_vocab=len(tokenizer))
 
 class BakaElephant(nn.Module):
     def __init__(self, d=8.0, a=1.0) -> None:
@@ -465,12 +472,7 @@ def try_load(obj, path):
 
 
 def make_model(tokenizer) -> BakaNetCausalLM:
-    cfg = BakaConfig(
-        dim_model=768,
-        dim_ff=3072*2, #TODO: remove me
-        n_heads=12,
-        n_layers=12,
-        n_vocab=len(tokenizer))
+    cfg = make_config(tokenizer)
     model = BakaNetCausalLM(cfg).bfloat16().cuda()
     return model
 
