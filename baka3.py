@@ -7,7 +7,7 @@ import os
 from transformers.activations import ACT2FN
 import torch
 from typing import Tuple
-from torch import LongTensor, Tensor
+from torch import LongTensor, Tensor, is_signed
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -98,7 +98,7 @@ class BakaConfig:
 def make_config(tokenizer):
     return BakaConfig(
         dim_model=768,
-        dim_ff=3072*2, #TODO: remove me
+        dim_ff=3072, #TODO: remove me
         n_heads=12,
         n_layers=12,
         n_vocab=len(tokenizer))
@@ -135,17 +135,36 @@ class BakaMLP(nn.Module):
         self.fc_down = nn.Linear(config.dim_ff, config.dim_model, False)
         self.name = name
 
-    def forward(self, state: BakaState|Tensor):
+    def forward(self, state: BakaState|Tensor, lora: Optional["BakaMLPLora"]=None):
         input = state.input if isinstance(state, BakaState) else state # TODO: is it cleaner to fix MLP to accept tensor only? meh
-        gate = self.act(self.fc_gate(input))
-        y = self.fc_up(input) * gate
-        y = self.fc_down(y)
+
+        gate = self.fc_gate(input)
+        if lora:
+            gate = gate + lora.fc_gate(input)
+
+        gate = self.act(gate)
+
+        up = self.fc_up(input)
+        if lora:
+            up = up + lora.fc_up(input)
+
+        y = up * gate
+        down = self.fc_down(y)
+        if lora:
+            down = down + lora.fc_down(y)
+        y = down
         return y
 
     def extra_repr(self) -> str:
         name = self.name or hex(id(self))
         return f'name={name!r}'
 
+class BakaMLPLora(nn.Module):
+    def __init__(self, config:BakaConfig) -> None:
+        super().__init__()
+        self.fc_gate = BakaLoRAProjection(config.dim_model, config.n_heads*2, config.dim_ff)
+        self.fc_up = BakaLoRAProjection(config.dim_model, config.n_heads*2, config.dim_ff)
+        self.fc_down = BakaLoRAProjection(config.dim_ff, config.n_heads*2, config.dim_model)
 
 class BakaAttention(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
@@ -246,6 +265,18 @@ class BakaAttention(nn.Module):
 def make_post_normalized(n_dim: int, base: nn.Module):
     return nn.Sequential(base, nn.LayerNorm(n_dim))
 
+class BakaLoRAProjection(nn.Module):
+    def __init__(self, dim_in, r, dim_out:Optional[int]=None):
+        super().__init__()
+        dim_out = dim_out or dim_in
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+        self.r = r        
+        self.down_cast = nn.Linear(dim_in, r)
+        self.up_cast = nn.Linear(r, dim_out)
+    
+    def forward(self, x):
+        return self.up_cast(self.down_cast(x))
 
 class BakaLayer(nn.Module):
     def __init__(self, config: BakaConfig, *, reused_mlp: Optional[BakaMLP], name=None) -> None:
@@ -254,13 +285,14 @@ class BakaLayer(nn.Module):
         self.norm_in = nn.LayerNorm(config.dim_model)
         self.attn = BakaAttention(config)
         self.mlp = reused_mlp or BakaMLP(config, name=f'ff_{name}')
+        self.mlp_lora = BakaMLPLora(config)
 
     def forward(self, state: BakaState):
         x0 = state.input
         assert x0 is not None
         state.input = self.norm_in(state.input)
         attn = self.attn(state)
-        mlp = self.mlp(state)
+        mlp = self.mlp(state, lora=self.mlp_lora)
         y = x0 + attn + mlp
         state.output = y
         return y
