@@ -42,7 +42,7 @@ class BakaState:
     input: Optional[Tensor] = None
     output: Optional[Tensor] = None
     offset: int = 0
-    past_state: Optional["BakaState"] = None  # if this is layer L at current chunk C, this field points to layer (L-1) in chunk (C-1)
+    past_state: Optional["BakaState"] = None  # if this is layer L at current chunk C, this field points to layer L in chunk (C-1)
     past_predcessor_state: Optional["BakaState"] = None  # if this is layer L at current chunk C, this field points to layer (L-1) in chunk (C-1)
     k_cache: Optional[Tensor] = None
     v_cache: Optional[Tensor] = None
@@ -65,9 +65,9 @@ class BakaState:
 
 @dataclass
 class BakaConfig:
-    dim_model: int = 1024
-    dim_ff: int = 0
-    dim_attn: int = 0
+    dim_model_start: int = 256
+    dim_model_increment: int = 128
+    dim_ff_mult: float = 4.0
     n_layers: int = 12
     n_heads: int = 4
     n_vocab: int = 32000
@@ -78,17 +78,33 @@ class BakaConfig:
     n_rmt_margins: int = 0
     rmt_solidifier: str = "none" # none, glu, mlp, gelephant
     act_fn: str = "elephant"
-    model_type = "baka_rmt"
+    model_type = "baka_fanout"
     use_flash_attn: bool = True
-
     def __post_init__(self):
-        self.dim_ff = self.dim_ff or self.dim_model * 4
-        self.dim_attn = self.dim_attn or self.dim_model
-        assert self.dim_attn % self.n_heads == 0
+        assert self.dim_model_increment > 0
 
-    @property
-    def dim_head(self):
-        return self.dim_attn // self.n_heads
+
+    def dim_attn(self, layer_num: int):
+        return self.dim_model(layer_num)
+
+    def dim_ff(self, layer_num: int):        
+        return int(self.dim_model(layer_num) * self.dim_ff_mult)
+
+    def dim_model(self, layer_num:int):
+        return self.dim_model_start + layer_num * self.dim_model_increment
+
+    def dim_head(self, layer_num:int):
+        return self.dim_attn(layer_num) // self.n_heads
+
+def make_config(tokenizer):
+    cfg = BakaConfig(
+        dim_model_start=384,
+        dim_model_increment=48,
+        dim_ff_mult=4.0,
+        n_heads=12,
+        n_layers=12,
+        n_vocab=len(tokenizer))
+    return cfg
 
 
 class BakaElephant(nn.Module):
@@ -114,13 +130,18 @@ def make_activation_fn(s):
 
 
 class BakaMLP(nn.Module):
-    def __init__(self, config: BakaConfig) -> None:
+    def __init__(self, config: BakaConfig, layer_num: int) -> None:
         super().__init__()
         self.config = config
+        self.dim_in = config.dim_model(layer_num)
+        self.dim_ff = config.dim_ff(layer_num)
+        self.dim_out = config.dim_model(layer_num+1)
+        self.num_layer = layer_num
         self.act = make_activation_fn(self.config.act_fn)
-        self.fc_gate = nn.Linear(config.dim_model, config.dim_ff, False)
-        self.fc_up = nn.Linear(config.dim_model, config.dim_ff, False)
-        self.fc_down = nn.Linear(config.dim_ff, config.dim_model, False)
+
+        self.fc_gate = nn.Linear(self.dim_in, self.dim_ff, False)
+        self.fc_up = nn.Linear(self.dim_in, self.dim_ff, False)
+        self.fc_down = nn.Linear(self.dim_ff, self.dim_out, False)
 
     def forward(self, state: BakaState|Tensor):
         input = state.input if isinstance(state, BakaState) else state # TODO: is it cleaner to fix MLP to accept tensor only? meh
@@ -131,14 +152,19 @@ class BakaMLP(nn.Module):
 
 
 class BakaAttention(nn.Module):
-    def __init__(self, config: BakaConfig) -> None:
+    def __init__(self, config: BakaConfig, layer_num: int) -> None:
         super().__init__()
         self.config = config
-        self.q = nn.Linear(config.dim_model, config.dim_attn, False)
-        self.k = nn.Linear(config.dim_model, config.dim_attn, False)
-        self.v = nn.Linear(config.dim_model, config.dim_model, False)
-        self.o = nn.Linear(config.dim_model, config.dim_model, False)
-        self.rot = RotaryEmbedding(config.dim_head, use_xpos=False)
+        self.dim_in = config.dim_model(layer_num)
+        self.dim_out = config.dim_model(layer_num+1)
+        self.dim_attn = config.dim_attn(layer_num)
+        self.num_layer = layer_num
+
+        self.q = nn.Linear(self.dim_in, self.dim_attn, False)
+        self.k = nn.Linear(self.dim_in, self.dim_attn, False)
+        self.v = nn.Linear(self.dim_attn, self.dim_attn, False)
+        self.o = nn.Linear(self.dim_attn, self.dim_out, False)
+        self.rot = RotaryEmbedding(config.dim_head(layer_num), use_xpos=False)
 
     def forward(self, state: BakaState):
         q, k, v = self.build_qkv(state)
@@ -160,12 +186,12 @@ class BakaAttention(nn.Module):
     def build_attn_mask(self, state: BakaState):
         # Will not be required in future versions of pytorch, hopefully.
         # See https://github.com/pytorch/pytorch/issues/108108
-        if state.past_predcessor_state is None:
+        if state.past_state is None:
             # No RMT here, which is not really ideal as RMT[-2] will not attend to following RMT[-1],
             # but it happens only once per sequence
             return True, None
         now_n_seq = state.n_seq
-        past_n_seq = state.past_predcessor_state.n_seq
+        past_n_seq = state.past_state.n_seq
 
         # Build a matrix for both past and present
         # 1 1 1 1  1 1 1
@@ -211,7 +237,8 @@ class BakaAttention(nn.Module):
         past_offset = current_offset = 0
 
         # restore the past
-        if (past := state.past_predcessor_state):
+        # TODO: do I need predcessor here?
+        if (past := state.past_state):
             past_k = past.k_cache
             past_v = past.v_cache
             assert past_k is not None and past_v is not None
@@ -229,14 +256,29 @@ class BakaAttention(nn.Module):
 def make_post_normalized(n_dim: int, base: nn.Module):
     return nn.Sequential(base, nn.LayerNorm(n_dim))
 
+class BakaZeroPad(nn.Module):
+    def __init__(self, dim_in:int, dim_out:int) -> None:
+        super().__init__()
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+
+    def forward(self, x: Tensor):
+        n_batch, n_seq = x.shape[0], x.shape[1]
+        n_pad = self.dim_out - self.dim_in
+        pad = torch.zeros(n_batch, n_seq, n_pad, dtype=x.dtype, device=x.device)
+        y = torch.cat((x, pad), -1)
+        return y
 
 class BakaLayer(nn.Module):
-    def __init__(self, config: BakaConfig) -> None:
+    def __init__(self, config: BakaConfig, layer_num: int) -> None:
         super().__init__()
         self.config = config
-        self.norm_in = nn.LayerNorm(config.dim_model)
-        self.attn = BakaAttention(config)
-        self.mlp = BakaMLP(config)
+        self.dim_in = config.dim_model(layer_num)
+        self.dim_out = config.dim_model(layer_num+1)
+        self.norm_in = nn.LayerNorm(self.dim_in)
+        self.attn = BakaAttention(config, layer_num)
+        self.mlp = BakaMLP(config, layer_num)
+        self.residual_pad = BakaZeroPad(self.dim_in, self.dim_out)
 
     def forward(self, state: BakaState):
         x0 = state.input
@@ -244,7 +286,8 @@ class BakaLayer(nn.Module):
         state.input = self.norm_in(state.input)
         attn = self.attn(state)
         mlp = self.mlp(state)
-        y = x0 + attn + mlp
+        xp = self.residual_pad(x0)
+        y = xp + attn + mlp
         state.output = y
         return y
 
@@ -253,7 +296,8 @@ class BakaRMT(nn.Module):
     def __init__(self, config: BakaConfig):
         super().__init__()
         self.config = config
-        self.rmt_tokens = nn.Parameter(torch.randn(config.n_rmt_tokens, config.dim_model))
+        self.rmt_tokens = nn.Parameter(torch.randn(config.n_rmt_tokens, config.dim_model(0)))
+        # TODO: remap
 
     def inject(self, current_start: BakaState, last_end: Optional[BakaState]) -> BakaRMTState:
         assert current_start.input is not None
@@ -261,7 +305,7 @@ class BakaRMT(nn.Module):
         if last_end is not None:
             assert last_end.output is not None
             assert last_end.rmt is not None
-            lhs = rhs = last_end.output[:, -last_end.rmt.rhs:]
+            lhs = rhs = last_end.output[:, -last_end.rmt.rhs:, :self.config.dim_model(0)]
             current_start.input = torch.cat((lhs, current_start.input, rhs), 1)
             return BakaRMTState(lhs=lhs.shape[1], rhs=rhs.shape[1])
 
@@ -281,7 +325,7 @@ class BakaPause(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
-        self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
+        self.pause_emb = nn.Parameter(torch.randn(config.dim_model(0)))
 
     def inject(self, state:BakaState):
         assert state.input is not None
@@ -311,7 +355,7 @@ class BakaNet(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
-        self.layers = nn.ModuleList([BakaLayer(config) for _ in range(config.n_layers)])
+        self.layers = nn.ModuleList([BakaLayer(config, n) for n in range(config.n_layers)])
         self.pause = BakaPause(config)
         self.rmt = BakaRMT(config)
 
@@ -351,6 +395,7 @@ class BakaNet(nn.Module):
             # Move in the model top to bottom
             for i, layer in enumerate(self.layers):
                 # Link current state to the past state
+                states[i].past_state = old_states[i]
                 states[i].past_predcessor_state = old_states[i-1] if i else None
                 states[i].pauses_pos = states[0].pauses_pos
                 states[i].rmt = states[0].rmt
@@ -376,6 +421,7 @@ class BakaNet(nn.Module):
             # Detach older states completely
             for state in old_states:
                 state.past_predcessor_state = None
+                state.past_state = None
 
         outputs = torch.cat(outputs, 1)
         return outputs, old_states or [] # type: ignore
@@ -393,9 +439,9 @@ class BakaNetCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.model = BakaNet(config)
-        self.vocab_in = nn.Embedding(config.n_vocab, config.dim_model)
-        self.norm_out = nn.LayerNorm(config.dim_model)
-        self.vocab_out = nn.Linear(config.dim_model, config.n_vocab, False)
+        self.vocab_in = nn.Embedding(config.n_vocab, config.dim_model(0))
+        self.norm_out = nn.LayerNorm(config.dim_model(config.n_layers))
+        self.vocab_out = nn.Linear(config.dim_model(config.n_layers), config.n_vocab, False)
 
         # HF compatibility hack
         self.model.get_input_embeddings = lambda: self.vocab_in # type: ignore
@@ -447,12 +493,7 @@ def try_load(obj, path):
 
 
 def make_model(tokenizer) -> BakaNetCausalLM:
-    cfg = BakaConfig(
-        dim_model=768,
-        dim_ff=3072,
-        n_heads=12,
-        n_layers=12,
-        n_vocab=len(tokenizer))
+    cfg = make_config(tokenizer)
     model = BakaNetCausalLM(cfg).bfloat16().cuda()
     return model
 
