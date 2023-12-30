@@ -169,12 +169,12 @@ class BakaAttention(nn.Module):
     def build_attn_mask(self, state: BakaState):
         # Will not be required in future versions of pytorch, hopefully.
         # See https://github.com/pytorch/pytorch/issues/108108
-        if state.past_predcessor_state is None:
+        if state.past_state is None:
             # No RMT here, which is not really ideal as RMT[-2] will not attend to following RMT[-1],
             # but it happens only once per sequence
             return True, None
         now_n_seq = state.n_seq
-        past_n_seq = state.past_predcessor_state.n_seq
+        past_n_seq = state.past_state.n_seq
 
         # Build a matrix for both past and present
         # 1 1 1 1  1 1 1
@@ -220,7 +220,7 @@ class BakaAttention(nn.Module):
         past_offset = current_offset = 0
 
         # restore the past
-        if (past := state.past_predcessor_state):
+        if (past := state.past_state):
             past_k = past.k_cache
             past_v = past.v_cache
             assert past_k is not None and past_v is not None
@@ -231,12 +231,7 @@ class BakaAttention(nn.Module):
         seq_dim = -3 if self.config.use_flash_attn else -2
         q = self.rot.rotate_queries_or_keys(q, seq_dim, offset=current_offset)
         k = self.rot.rotate_queries_or_keys(k, seq_dim, offset=past_offset)
-
         return q, k, v
-
-
-def make_post_normalized(n_dim: int, base: nn.Module):
-    return nn.Sequential(base, nn.LayerNorm(n_dim))
 
 
 class BakaLayer(nn.Module):
@@ -361,6 +356,7 @@ class BakaNet(nn.Module):
             for i, layer in enumerate(self.layers):
                 # Link current state to the past state
                 states[i].past_predcessor_state = old_states[i-1] if i else None
+                states[i].past_state = old_states[i]
                 states[i].pauses_pos = states[0].pauses_pos
                 states[i].rmt = states[0].rmt
 
@@ -385,6 +381,7 @@ class BakaNet(nn.Module):
             # Detach older states completely
             for state in old_states:
                 state.past_predcessor_state = None
+                state.past_state = None
 
         outputs = torch.cat(outputs, 1)
         return outputs, old_states or [] # type: ignore
