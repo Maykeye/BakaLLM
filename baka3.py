@@ -257,6 +257,7 @@ def make_post_normalized(n_dim: int, base: nn.Module):
     return nn.Sequential(base, nn.LayerNorm(n_dim))
 
 class BakaZeroPad(nn.Module):
+    # Control, to do: remove once better upscaler found
     def __init__(self, dim_in:int, dim_out:int) -> None:
         super().__init__()
         self.dim_in = dim_in
@@ -269,6 +270,68 @@ class BakaZeroPad(nn.Module):
         y = torch.cat((x, pad), -1)
         return y
 
+class BakaLinearUpscaler(nn.Module):
+    # upscale_missing=False ==> results unknown
+    # upscale_missing=True ==> Garbage, to do: remove
+    def __init__(self, dim_in:int, dim_out:int, upscale_missing_elements_only=False) -> None:
+        super().__init__()
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+        self.upscale_missing_elements_only=upscale_missing_elements_only
+
+        delta = self.dim_out - self.dim_in
+        if upscale_missing_elements_only:
+            assert dim_out > dim_in
+            self.fc = nn.Linear(dim_in, delta, False)
+        else:
+            self.fc = nn.Linear(dim_in, dim_out, False)
+        self.fc.weight.data *= 1e-4
+
+    def forward(self, x: Tensor):
+        y = self.fc(x)
+        if self.upscale_missing_elements_only:
+            y = torch.cat((x, y), -1)
+        else:
+            y = x + y # todo config?
+        return y
+
+class BakaLinearPerHeadUpscaler(nn.Module):
+    def __init__(self, n_heads:int, dim_in:int, dim_out:int) -> None:
+        # should I pass bakaconfig for consistency?
+        super().__init__()
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+        self.n_heads = n_heads 
+
+        self.fc = nn.Linear(dim_in, dim_out - dim_in, False)
+        self.fc.weight.data *= 1e-4
+
+    def forward(self, x: Tensor):
+        y = self.fc(x)
+        y = rearrange(y, "b t (h c) -> b t h c", h = self.n_heads)
+        x = rearrange(x, "b t (h c) -> b t h c", h = self.n_heads)
+        y = torch.cat((x, y), -1)
+        y = rearrange(y, "b t h c -> b t (h c)")
+        return y
+
+class BakaZeroPadPerHeadUpscaler(nn.Module):
+    def __init__(self, n_heads:int, dim_in:int, dim_out:int) -> None:
+        # should I pass bakaconfig for consistency?
+        super().__init__()
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+        self.n_heads = n_heads 
+
+
+    def forward(self, x: Tensor):
+        n_batch, n_seq = x.shape[0], x.shape[1]
+        y = torch.zeros(n_batch, n_seq, self.dim_out - self.dim_in, dtype=x.dtype, device=x.device)
+        y = rearrange(y, "b t (h c) -> b t h c", h = self.n_heads)
+        x = rearrange(x, "b t (h c) -> b t h c", h = self.n_heads)
+        y = torch.cat((x, y), -1)
+        y = rearrange(y, "b t h c -> b t (h c)")
+        return y
+
 class BakaLayer(nn.Module):
     def __init__(self, config: BakaConfig, layer_num: int) -> None:
         super().__init__()
@@ -278,7 +341,7 @@ class BakaLayer(nn.Module):
         self.norm_in = nn.LayerNorm(self.dim_in)
         self.attn = BakaAttention(config, layer_num)
         self.mlp = BakaMLP(config, layer_num)
-        self.residual_pad = BakaZeroPad(self.dim_in, self.dim_out)
+        self.upscaler = BakaZeroPadPerHeadUpscaler(config.n_heads, self.dim_in, self.dim_out)
 
     def forward(self, state: BakaState):
         x0 = state.input
@@ -286,7 +349,7 @@ class BakaLayer(nn.Module):
         state.input = self.norm_in(state.input)
         attn = self.attn(state)
         mlp = self.mlp(state)
-        xp = self.residual_pad(x0)
+        xp = self.upscaler(x0)
         y = xp + attn + mlp
         state.output = y
         return y
@@ -649,6 +712,7 @@ def main():
 
     if do_save:
         torch.save(model.state_dict(), model_path)
+        torch.save(model.state_dict(), model_path+run_id)
         torch.save(opt.state_dict(), opt_path)
     print("DONE")
 

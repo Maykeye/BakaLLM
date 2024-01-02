@@ -150,13 +150,16 @@ def record(ctx: TestContext, loss, nans):
 
 
 def main():
+    global DEVICE
     print("Loading the model")
     parser = optparse.OptionParser()
     parser.add_option("-m", "--model", dest="model", help="load model")
     parser.add_option("-p", "--model-path", dest="model_path", help="force to load bakanet state_dict from the given file")
     parser.add_option("-n", "--n_ctx", dest="n_ctx", type="int", help="context size")
     parser.add_option("-t", "--textnote", dest="note", help="note to myself")
+    parser.add_option("-d", "--device", dest="device", help="device", default=DEVICE)
     options, _ = parser.parse_args()
+    DEVICE=options.device
 
     loaders = {
         "pythia-14m": partial(impl_load_transformers, "pythia-14m"),
