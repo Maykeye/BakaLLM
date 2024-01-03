@@ -712,7 +712,7 @@ def main():
 
     if do_save:
         torch.save(model.state_dict(), model_path)
-        torch.save(model.state_dict(), model_path+run_id)
+        torch.save(model.state_dict(), model_path+"."+run_id)
         torch.save(opt.state_dict(), opt_path)
     print("DONE")
 
