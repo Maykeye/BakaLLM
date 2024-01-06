@@ -88,7 +88,9 @@ class BakaConfig:
         return self.dim_model(layer_num)
 
     def dim_ff(self, layer_num: int):        
-        return int(self.dim_model(layer_num) * self.dim_ff_mult)
+        #return int(self.dim_model(layer_num) * self.dim_ff_mult)
+        del layer_num
+        return int(self.dim_model(self.n_layers) * self.dim_ff_mult)
 
     def dim_model(self, layer_num:int):
         return self.dim_model_start + layer_num * self.dim_model_increment
