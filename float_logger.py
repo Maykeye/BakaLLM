@@ -74,6 +74,7 @@ class FloatLogger:
                 session_id INTEGER NOT NULL,
                 timestamp TIMESTAMP NOT NULL
             );""")
+            c.execute("CREATE INDEX IF NOT EXISTS Data_Session_Idx ON Data(session_id);")
             r = c.execute("PRAGMA table_info(Data);")
             columns = r.fetchall()
             columns = [column[1] for column in columns] #1 -- column name
