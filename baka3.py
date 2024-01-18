@@ -588,24 +588,6 @@ def propogate_past_states(past: Optional[list[BakaState]], mb: MiniBatch, detach
                 v = v.detach()
             setattr(state, k, v)
 
-def get_grad_norm(model):
-    total_norm = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-    total_norm = total_norm ** (1. / 2)
-    return total_norm
-
-def autoclip_gradient(model: nn.Module, grad_history: list[float], clip_percentile: float=10.0):
-    obs_grad_norm = get_grad_norm(model)
-    grad_history.append(obs_grad_norm)
-    clip_value = np.percentile(grad_history, clip_percentile)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value) #type: ignore
-
-AUTOCLIP = "autoclip"
-DYNAMIC_AUTOCLIP="dynamic"
-AUTOCLIP_HISTORY=[]
 def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=0, detach_at = 0, write_log=None):
     past = None
 
@@ -621,15 +603,7 @@ def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_fi
         loss = out.loss
         loss.backward()
         if clip is not None:
-            if clip == AUTOCLIP:
-                autoclip_gradient(model, AUTOCLIP_HISTORY)
-            elif clip == DYNAMIC_AUTOCLIP:
-                clip_alpha = 0.5
-                clip_beta = 2 / torch.e
-                step_clip = clip_alpha * (mb.progress) + clip_beta * (1-mb.progress)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), step_clip) #type: ignore
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip) #type: ignore
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip) #type: ignore
         opt.step()
         opt.zero_grad()
         if write_log:
