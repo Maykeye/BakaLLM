@@ -2,7 +2,6 @@ import sys
 import numpy as np
 import optparse
 from tqdm.auto import tqdm
-import wandb
 import os
 from transformers.activations import ACT2FN
 import torch
@@ -26,10 +25,10 @@ import flash_attn
 
 def my_log(**kwargs):
     flog(**kwargs)
-    wandb_log(**kwargs)
 
-def model_numel(m: nn.Module):
-    return sum(p.numel() for p in m.parameters())
+def model_numel(m: nn.Module, grad_only=False):
+    return sum(p.numel() * (p.requires_grad or not grad_only)
+               for p in m.parameters())
 
 @dataclass
 class BakaRMTState:
@@ -344,14 +343,26 @@ class BakaLayer(nn.Module):
         self.attn = BakaAttention(config, layer_num)
         self.mlp = BakaMLP(config, layer_num)
         self.upscaler = BakaZeroPadPerHeadUpscaler(config.n_heads, self.dim_in, self.dim_out)
+        self.enabled = True
+
+    def enabled_(self, enabled=True):
+        self.enabled = enabled
+        return self
 
     def forward(self, state: BakaState):
+        # If layer is disabled, only upscaler is active
         x0 = state.input
         assert x0 is not None
+        xp = self.upscaler(x0)
+
+        if not self.enabled:
+            xp = self.upscaler(state.input)
+            state.output = xp
+            return xp
+
         state.input = self.norm_in(state.input)
         attn = self.attn(state)
         mlp = self.mlp(state)
-        xp = self.upscaler(x0)
         y = xp + attn + mlp
         state.output = y
         return y
@@ -491,6 +502,23 @@ class BakaNet(nn.Module):
         outputs = torch.cat(outputs, 1)
         return outputs, old_states or [] # type: ignore
 
+    def stacking_training(self, n_start: int, n_train: int):
+        for n, layer in enumerate(self.layers):
+            if n < n_start:
+                print(f"Freezing layer {n}")
+                layer.enabled_(True)
+                layer.requires_grad_(False)
+            elif n < n_start + n_train:
+                print(f"Focusing on layer {n}")
+                layer.enabled_(True)
+                layer.requires_grad_(True)
+            else:
+                print(f"Disabling layer {n}")
+                layer.requires_grad_(False)
+                layer.enabled_(False)
+
+
+
 
 @dataclass
 class BakaCausalLMOutput:
@@ -511,12 +539,18 @@ class BakaNetCausalLM(nn.Module):
         # HF compatibility hack
         self.model.get_input_embeddings = lambda: self.vocab_in # type: ignore
 
+    def stacking_training(self, n_start: int, n_train: int):
+        self.model.stacking_training(n_start, n_train)
+        if n_start > 0:
+            self.vocab_in.requires_grad_(False)
+
     def forward(self,
                 input_ids: LongTensor,
                 labels: Optional[LongTensor] = None,
                 attention_mask="ignored",
                 old_states: Optional[list[BakaState]] = None
                 ):
+        del attention_mask
         y = self.vocab_in(input_ids)
         y, states = self.model(y, old_states)
         y = self.norm_out(y)
@@ -527,25 +561,6 @@ class BakaNetCausalLM(nn.Module):
             y_true = rearrange(labels[:, 1:], 'b t -> (b t)')
             loss = F.cross_entropy(y_pred, y_true)
         return BakaCausalLMOutput(loss=loss, logits=y, states=states)
-
-
-WANDB_INITED = False
-
-
-def wandb_log(**kwargs):
-    global WANDB_INITED
-    project = kwargs.pop("project")
-    run_id = kwargs.pop("run_id")
-    if not WANDB_INITED:
-        WANDB_INITED = True
-
-        wandb.init(
-            project=project,
-            id=run_id,
-            resume=True,
-            config={})
-
-    wandb.log(kwargs)
 
 
 def try_load(obj, path):
@@ -617,8 +632,8 @@ def main():
                       help="set project name to PROJECT", metavar="PROJECT")
     parser.add_option("-r", "--run", dest="run_id",
                       help="set run id to RUN_ID", metavar="RUN_ID")
-    parser.add_option("-w", "--wandb", dest="do_log", action="store_true",
-                      help="enable WANDB log")
+    parser.add_option("-w", "--write-log", dest="do_log", action="store_true",
+                      help="enable log")
     parser.add_option("-l", "--load", dest="do_load", action="store_true",
                       help="load existing model")
     parser.add_option("-b", "--batch-size", dest="batch_size", default=5, type="int",
@@ -628,6 +643,7 @@ def main():
     parser.add_option("-S", "--no-save", dest="do_save", action="store_false", default=True,
                       help="do not save the progress(default: save)")
     parser.add_option("-d", "--detach", metavar="N", help="stop gradient after N steps", type="int", default=8)
+    parser.add_option("-k", "--keep", metavar="A,N", help="train N layers after layer A", type="str", default=None)
 
     debug_args = None
     if sys.gettrace():
@@ -644,6 +660,7 @@ def main():
     do_save: bool = options.do_save or do_load
     batch_size: int = options.batch_size
     detach_at: int = options.detach
+    keep: str = options.keep
 
     assert project, "project name is required"
     assert run_id, "run id is required"
@@ -669,6 +686,10 @@ def main():
         try_load(model, model_path)
         try_load(opt, opt_path)
 
+    if keep:
+        n_start, n_train = map(int, keep.split(","))
+        model.stacking_training(n_start, n_train)
+    print(f"#trainable: {hl_color}{model_numel(model, True)}{reset_color}")
 
 
     def write_log(loss: Tensor, mb: MiniBatch):
