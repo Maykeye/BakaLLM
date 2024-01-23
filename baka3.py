@@ -689,6 +689,8 @@ def main():
     if keep:
         n_start, n_train = map(int, keep.split(","))
         model.stacking_training(n_start, n_train)
+    else:
+        model.requires_grad_(True)
     print(f"#trainable: {hl_color}{model_numel(model, True)}{reset_color}")
 
 
