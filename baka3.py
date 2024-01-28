@@ -503,15 +503,69 @@ class BakaNet(nn.Module):
         return outputs, old_states or [] # type: ignore
 
     def stacking_training(self, n_start: int, n_train: int):
+
+
+        def expand(key:str, value, dst: dict[str, Tensor]):
+            if not isinstance(value, torch.Tensor):
+                raise NotImplementedError(f"Type {type(value)} is not supported")
+            dest_value = dst[key]
+            if ".rot." in key:
+                assert key.endswith("rot.freqs")
+                return dest_value
+
+            n_heads = self.config.n_heads
+
+            if dest_value.numel() == value.numel():
+                raise NotImplementedError(f"... {key}, {dest_value.shape}")
+            if value.dim() == 1:
+                x = rearrange(value, "(h c) -> h c", h = n_heads)
+                y = rearrange(dest_value, "(h c) -> h c", h = n_heads)
+                per_head = y.shape[1] - x.shape[1]
+                x = torch.cat((x, x[:, :per_head]), -1)
+                x = rearrange(x, "h c -> (h c)")
+                assert x.numel() == y.numel()
+                return x
+
+            if value.dim() == 2:
+                x = rearrange(value, "x (h c) -> x h c", h = n_heads)
+                y = rearrange(dest_value, "x (h c) -> x h c", h = n_heads)
+                per_head = y.shape[2] - x.shape[2]
+                x = torch.cat((x, x[..., :per_head]), -1)
+                x = rearrange(x, "x h c -> x (h c)")
+
+                x = rearrange(x, "x (h c) -> c h x", h = n_heads)
+                y = rearrange(dest_value, "x (h c) -> c h x", h = n_heads)
+                per_head = y.shape[2] - x.shape[2]
+                x = torch.cat((x, x[..., :per_head]), -1)
+                x = rearrange(x, "c h x -> x (h c)")
+                assert x.numel() == y.numel(), f"{x.shape=}, {dest_value.shape=}"
+                assert x.shape == dest_value.shape, f"{x.shape=} {dest_value.shape=}"
+                return x
+
+            raise NotImplementedError(f"{key}: {value.shape}, {dest_value.shape}")
+            
+
+        copy = True
         for n, layer in enumerate(self.layers):
             if n < n_start:
                 print(f"Freezing layer {n}")
                 layer.enabled_(True)
                 layer.requires_grad_(False)
             elif n < n_start + n_train:
-                print(f"Focusing on layer {n}")
                 layer.enabled_(True)
                 layer.requires_grad_(True)
+                if copy:
+                    copy_from = n - n_train
+                    if copy_from >= 0:
+                        dst = layer.state_dict()
+                        print(f"Focusing on layer {n}, copy of {copy_from}")
+                        src_state = {k:expand(k, v, dst) for (k,v) in self.layers[copy_from].state_dict().items()}
+                        layer.load_state_dict(src_state)
+                    else:
+                        print(f"Focusing on layer {n}")
+                else:
+                    print(f"Focusing on layer {n}")
+
             else:
                 print(f"Disabling layer {n}")
                 layer.requires_grad_(False)
