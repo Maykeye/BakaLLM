@@ -22,6 +22,9 @@ from transformers import set_seed
 
 import flash_attn
 
+from mamba_ssm.modules.mamba_simple import Mamba
+
+
 def my_log(**kwargs):
     flog(**kwargs)
 
@@ -74,7 +77,7 @@ class BakaConfig:
     n_rmt_margins: int = 0
     rmt_solidifier: str = "none" # none, glu, mlp, gelephant
     act_fn: str = "elephant"
-    model_type = "baka_rmt"
+    model_type = "baka_mamba"
     use_flash_attn: bool = True
 
     def __post_init__(self):
@@ -136,17 +139,25 @@ class BakaMLP(nn.Module):
 
 
 class BakaAttention(nn.Module):
-    def __init__(self, config: BakaConfig) -> None:
+    def __init__(self, config: BakaConfig, use_mamba=False) -> None:
         super().__init__()
         self.config = config
         self.q = nn.Linear(config.dim_model, config.dim_attn, False)
         self.k = nn.Linear(config.dim_model, config.dim_attn, False)
         self.v = nn.Linear(config.dim_model, config.dim_model, False)
         self.o = nn.Linear(config.dim_model, config.dim_model, False)
+        self.mamba = Mamba(config.dim_model) if use_mamba else None
         self.rot = RotaryEmbedding(config.dim_head, use_xpos=False)
 
     def forward(self, state: BakaState):
         q, k, v = self.build_qkv(state)
+        n_batch = q.shape[0]
+        if self.mamba:
+            # reshape back to original shape
+            # TODO: mamba per head? takes less parms
+            mamba_input = v.view(n_batch, -1, self.config.dim_model)
+            v = self.mamba(mamba_input).view(v.shape)
+
         if self.config.use_flash_attn:
             # NB: Flash attention ignores RMT mask
             y = flash_attn.flash_attn_func(q, k, v, causal=True) 
@@ -224,6 +235,7 @@ class BakaAttention(nn.Module):
             k = torch.cat((past_k, k), seq_dim)
             v = torch.cat((past_v, v), seq_dim)
             current_offset = past.n_seq
+
         seq_dim = -3 if self.config.use_flash_attn else -2
         q = self.rot.rotate_queries_or_keys(q, seq_dim, offset=current_offset)
         k = self.rot.rotate_queries_or_keys(k, seq_dim, offset=past_offset)
@@ -231,11 +243,13 @@ class BakaAttention(nn.Module):
 
 
 class BakaLayer(nn.Module):
-    def __init__(self, config: BakaConfig) -> None:
+    def __init__(self, config: BakaConfig, layer_idx: int) -> None:
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
         self.norm_in = nn.LayerNorm(config.dim_model)
-        self.attn = BakaAttention(config)
+        # TODO: parm me
+        self.attn = BakaAttention(config, use_mamba=layer_idx%4 == 0)
         self.mlp = BakaMLP(config)
 
     def forward(self, state: BakaState):
@@ -311,7 +325,9 @@ class BakaNet(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
-        self.layers = nn.ModuleList([BakaLayer(config) for _ in range(config.n_layers)])
+        self.layers = nn.ModuleList([
+            BakaLayer(config, j) for j in range(config.n_layers)
+        ])
         self.pause = BakaPause(config)
         self.rmt = BakaRMT(config)
 
