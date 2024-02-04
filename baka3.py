@@ -1,8 +1,6 @@
 import sys
-import numpy as np
 import optparse
 from tqdm.auto import tqdm
-import wandb
 import os
 from transformers.activations import ACT2FN
 import torch
@@ -26,7 +24,6 @@ import flash_attn
 
 def my_log(**kwargs):
     flog(**kwargs)
-    wandb_log(**kwargs)
 
 def model_numel(m: nn.Module):
     return sum(p.numel() for p in m.parameters())
@@ -43,7 +40,6 @@ class BakaState:
     output: Optional[Tensor] = None
     offset: int = 0
     past_state: Optional["BakaState"] = None  # if this is layer L at current chunk C, this field points to layer (L-1) in chunk (C-1)
-    past_predcessor_state: Optional["BakaState"] = None  # if this is layer L at current chunk C, this field points to layer (L-1) in chunk (C-1)
     k_cache: Optional[Tensor] = None
     v_cache: Optional[Tensor] = None
     pauses_pos: Optional[list[int]] = None
@@ -355,7 +351,6 @@ class BakaNet(nn.Module):
             # Move in the model top to bottom
             for i, layer in enumerate(self.layers):
                 # Link current state to the past state
-                states[i].past_predcessor_state = old_states[i-1] if i else None
                 states[i].past_state = old_states[i]
                 states[i].pauses_pos = states[0].pauses_pos
                 states[i].rmt = states[0].rmt
@@ -380,7 +375,6 @@ class BakaNet(nn.Module):
 
             # Detach older states completely
             for state in old_states:
-                state.past_predcessor_state = None
                 state.past_state = None
 
         outputs = torch.cat(outputs, 1)
@@ -425,22 +419,6 @@ class BakaNetCausalLM(nn.Module):
 
 
 WANDB_INITED = False
-
-
-def wandb_log(**kwargs):
-    global WANDB_INITED
-    project = kwargs.pop("project")
-    run_id = kwargs.pop("run_id")
-    if not WANDB_INITED:
-        WANDB_INITED = True
-
-        wandb.init(
-            project=project,
-            id=run_id,
-            resume=True,
-            config={})
-
-    wandb.log(kwargs)
 
 
 def try_load(obj, path):
@@ -492,15 +470,6 @@ def get_grad_norm(model):
     total_norm = total_norm ** (1. / 2)
     return total_norm
 
-def autoclip_gradient(model: nn.Module, grad_history: list[float], clip_percentile: float=10.0):
-    obs_grad_norm = get_grad_norm(model)
-    grad_history.append(obs_grad_norm)
-    clip_value = np.percentile(grad_history, clip_percentile)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value) #type: ignore
-
-AUTOCLIP = "autoclip"
-DYNAMIC_AUTOCLIP="dynamic"
-AUTOCLIP_HISTORY=[]
 def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=0, detach_at = 0, write_log=None):
     past = None
 
@@ -516,15 +485,7 @@ def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_fi
         loss = out.loss
         loss.backward()
         if clip is not None:
-            if clip == AUTOCLIP:
-                autoclip_gradient(model, AUTOCLIP_HISTORY)
-            elif clip == DYNAMIC_AUTOCLIP:
-                clip_alpha = 0.5
-                clip_beta = 2 / torch.e
-                step_clip = clip_alpha * (mb.progress) + clip_beta * (1-mb.progress)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), step_clip) #type: ignore
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip) #type: ignore
+           torch.nn.utils.clip_grad_norm_(model.parameters(), clip) #type: ignore
         opt.step()
         opt.zero_grad()
         if write_log:
@@ -538,7 +499,7 @@ def main():
                       help="set project name to PROJECT", metavar="PROJECT")
     parser.add_option("-r", "--run", dest="run_id",
                       help="set run id to RUN_ID", metavar="RUN_ID")
-    parser.add_option("-w", "--wandb", dest="do_log", action="store_true",
+    parser.add_option("-w", "--write-log", dest="do_log", action="store_true",
                       help="enable WANDB log")
     parser.add_option("-l", "--load", dest="do_load", action="store_true",
                       help="load existing model")
