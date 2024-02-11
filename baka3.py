@@ -139,24 +139,17 @@ class BakaMLP(nn.Module):
 
 
 class BakaAttention(nn.Module):
-    def __init__(self, config: BakaConfig, use_mamba=False) -> None:
+    def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
         self.q = nn.Linear(config.dim_model, config.dim_attn, False)
         self.k = nn.Linear(config.dim_model, config.dim_attn, False)
         self.v = nn.Linear(config.dim_model, config.dim_model, False)
         self.o = nn.Linear(config.dim_model, config.dim_model, False)
-        self.mamba = Mamba(config.dim_model) if use_mamba else None
         self.rot = RotaryEmbedding(config.dim_head, use_xpos=False)
 
     def forward(self, state: BakaState):
         q, k, v = self.build_qkv(state)
-        n_batch = q.shape[0]
-        if self.mamba:
-            # reshape back to original shape
-            # TODO: mamba per head? takes less parms
-            mamba_input = v.view(n_batch, -1, self.config.dim_model)
-            v = self.mamba(mamba_input).view(v.shape)
 
         if self.config.use_flash_attn:
             # NB: Flash attention ignores RMT mask
@@ -209,8 +202,11 @@ class BakaAttention(nn.Module):
 
     def build_qkv(self, state: BakaState):
         # project
-        q = self.q(state.input)
-        k = self.k(state.input)
+
+        x = state.input
+        xq = x
+        q = self.q(xq)
+        k = self.k(xq)
         v = self.v(state.input)
 
         arrangement = "b t (h f) -> "
@@ -248,9 +244,13 @@ class BakaLayer(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.norm_in = nn.LayerNorm(config.dim_model)
-        # TODO: parm me
-        self.attn = BakaAttention(config, use_mamba=layer_idx%4 == 0)
+        self.attn = BakaAttention(config)
         self.mlp = BakaMLP(config)
+        # TODO: parm me
+        use_mamba = layer_idx % 2 == 0
+        self.mamba = Mamba(config.dim_model) if use_mamba else None
+        self.norm_mamba = nn.LayerNorm(config.dim_model) if use_mamba else None
+
 
     def forward(self, state: BakaState):
         x0 = state.input
@@ -259,6 +259,12 @@ class BakaLayer(nn.Module):
         attn = self.attn(state)
         mlp = self.mlp(state)
         y = x0 + attn + mlp
+        if self.mamba:
+            x0 = y
+            # TODO: move to separate BakaMamba{Mamba->Norm}?
+            x_mamba = self.norm_mamba(y) # type: ignore
+            y = self.mamba(x_mamba)
+            y = y + x0
         state.output = y
         return y
 
@@ -422,6 +428,7 @@ class BakaNetCausalLM(nn.Module):
                 attention_mask="ignored",
                 old_states: Optional[list[BakaState]] = None
                 ):
+        del attention_mask # not used
         y = self.vocab_in(input_ids)
         y, states = self.model(y, old_states)
         y = self.norm_out(y)
@@ -586,6 +593,7 @@ def main():
 
     if do_save:
         torch.save(model.state_dict(), model_path)
+        torch.save(model.state_dict(), model_path.replace(".bin", f".e.{run_id}.bin"))
         torch.save(opt.state_dict(), opt_path)
     print("DONE")
 
