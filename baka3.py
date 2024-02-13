@@ -595,6 +595,7 @@ def main():
         torch.save(model.state_dict(), model_path)
         torch.save(model.state_dict(), model_path.replace(".bin", f".e.{run_id}.bin"))
         torch.save(opt.state_dict(), opt_path)
+        torch.save(opt.state_dict(), opt_path.replace(".bin", f".e.{run_id}.bin"))
     print("DONE")
 
 
