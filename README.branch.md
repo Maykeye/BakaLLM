@@ -11,3 +11,6 @@ MineE1: B8 4.27630186080933 (Mamba(norm(x0+attn+mlp)) + x0)
 Proper E1 : B5: 4.26171875 (Mamba(Norm(x0+attn+mlp))
  Proper E2: B5: 3.99271
  Proper E2: B5: 3.88385 (new record, yay)
+
+Seq E1; B5: 4.5632 (Mamba(MLP(Attn))
+Seq E1; B5: 4.47630 (MLP(attn(mamba)))
