@@ -72,6 +72,7 @@ class BakaConfig:
     n_vocab: int = 32000
     n_ctx: int = 512
     n_pauses: int = 8
+    mamba_each_nth_layer: int = 2
     is_pause_pos_random: bool = False
     n_rmt_tokens: int = 16
     n_rmt_margins: int = 0
@@ -94,6 +95,7 @@ def make_config(tokenizer):
         dim_model=768,
         dim_ff=3072,
         n_heads=12,
+        #mamba_each_nth_layer=4,
         n_layers=12,
         n_vocab=len(tokenizer))
     return cfg
@@ -237,6 +239,18 @@ class BakaAttention(nn.Module):
         k = self.rot.rotate_queries_or_keys(k, seq_dim, offset=past_offset)
         return q, k, v
 
+class BakaMamba(nn.Module):
+    """ Mamba with residual """
+    def __init__(self, config: BakaConfig) -> None:
+        super().__init__()
+        self.norm_in = nn.LayerNorm(config.dim_model)
+        self.mamba = Mamba(config.dim_model)
+
+    def forward(self, x: Tensor):
+        x_norm = self.norm(x)
+        y = self.mamba(x_norm)
+        y = y + x
+        return y
 
 class BakaLayer(nn.Module):
     def __init__(self, config: BakaConfig, layer_idx: int) -> None:
@@ -247,7 +261,7 @@ class BakaLayer(nn.Module):
         self.attn = BakaAttention(config)
         self.mlp = BakaMLP(config)
         # TODO: parm me
-        use_mamba = layer_idx % 2 == 0
+        use_mamba = layer_idx % self.config.mamba_each_nth_layer == 0
         self.mamba = Mamba(config.dim_model) if use_mamba else None
         self.norm_mamba = nn.LayerNorm(config.dim_model) if use_mamba else None
 
