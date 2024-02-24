@@ -95,8 +95,8 @@ def make_config(tokenizer):
         dim_model=768,
         dim_ff=3072,
         n_heads=12,
-        #mamba_each_nth_layer=4,
-        n_layers=12,
+        mamba_each_nth_layer=1,
+        n_layers=8,
         n_vocab=len(tokenizer))
     return cfg
 

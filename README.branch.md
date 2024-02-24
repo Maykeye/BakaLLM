@@ -16,3 +16,7 @@ Proper E1 : B5: 4.26171875 (Mamba(Norm(x0+attn+mlp)) [each 2nd]
 Proper E1 : B5: 4.36745 [each 4th]
        E2 :   : 4.05729
        E3 :   : 3.94271
+
+Mamba L8 E1: B5: 4.23281 (8 layers, but each with mamba)
+         E2: :   3.98490
+         E3: :   3.87865
