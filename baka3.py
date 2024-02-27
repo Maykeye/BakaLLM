@@ -52,11 +52,11 @@ class KVCache:
         return self.k_cache.shape[0]
 
 @dataclass
-class BakaState:
+class BakaLayerState:
     """ Normalized state of the layer """
     input: Optional[Tensor] = None
     output: Optional[Tensor] = None
-    past_state: Optional["BakaState"] = None  # if this is layer L at current chunk C, this field points to layer (L-1) in chunk (C-1)
+    past_state: Optional["BakaLayerState"] = None  # if this is layer L at current chunk C, this field points to layer (L-1) in chunk (C-1)
     kv_caches: list[KVCache] = dataclasses.field(default_factory=list)
 
     pauses_pos: Optional[list[int]] = None
@@ -74,6 +74,16 @@ class BakaState:
     def device(self):
         assert self.input is not None
         return self.input.device
+
+class BakaNetState:
+    def __init__(self, n_layers):
+        self.layers = [BakaLayerState() for _ in range(n_layers)]
+
+    def __getitem__(self, n):
+        return self.layers[n]
+
+    def __iter__(self):
+        return iter(self.layers)
 
 
 @dataclass
@@ -162,8 +172,7 @@ class BakaMLP(nn.Module):
         self.fc_up = nn.Linear(config.dim_model, config.dim_ff, False)
         self.fc_down = nn.Linear(config.dim_ff, config.dim_model, False)
 
-    def forward(self, state: BakaState|Tensor):
-        input = state.input if isinstance(state, BakaState) else state # TODO: is it cleaner to fix MLP to accept tensor only? meh
+    def forward(self, input: Tensor):
         gate = self.act(self.fc_gate(input))
         y = self.fc_up(input) * gate
         y = self.fc_down(y)
@@ -197,7 +206,7 @@ class BakaAttention(nn.Module):
 
         assert config.use_flash_attn, "Flash attention required"
 
-    def forward(self, state: BakaState):
+    def forward(self, state: BakaLayerState):
         assert state.input is not None
         ys = []
         caches = []
@@ -275,12 +284,12 @@ class BakaLayer(nn.Module):
         self.mamba = BakaMamba(config)
 
 
-    def forward(self, state: BakaState):
+    def forward(self, state: BakaLayerState):
         x0 = state.input
         assert x0 is not None
         state.input = self.norm_in(state.input)
         attn = self.attn(state)
-        mlp = self.mlp(state)
+        mlp = self.mlp(state.input)
         y = x0 + attn + mlp
         mamba = self.mamba(y)
         y = y + mamba
@@ -294,11 +303,11 @@ class BakaRMT(nn.Module):
         self.config = config
         self.rmt_tokens = nn.Parameter(torch.randn(config.n_rmt_tokens, config.dim_model))
 
-    def inject(self, current_start: BakaState, last_end: Optional[BakaState]) -> BakaRMTState:
+    def inject(self, current_start: BakaLayerState, last_end: BakaLayerState) -> BakaRMTState:
         assert current_start.input is not None
+        assert last_end is not None
 
-        if last_end is not None:
-            assert last_end.output is not None
+        if last_end.output is not None:
             assert last_end.rmt is not None
             lhs = rhs = last_end.output[:, -last_end.rmt.rhs:]
             current_start.input = torch.cat((lhs, current_start.input, rhs), 1)
@@ -322,7 +331,7 @@ class BakaPause(nn.Module):
         self.config = config
         self.pause_emb = nn.Parameter(torch.randn(config.dim_model))
 
-    def inject(self, state:BakaState):
+    def inject(self, state:BakaLayerState):
         assert state.input is not None
         def rand_pos(n) -> int:
             return int(torch.randint(1, n+1, (1,)).item())
@@ -358,8 +367,8 @@ class BakaNet(nn.Module):
 
     def forward(self,
                 input: Tensor,
-                old_states: Optional[list[Optional[BakaState]]] = None # type: ignore
-        ) -> Tuple[Tensor, list[BakaState]]:
+                old_states: Optional[BakaNetState] = None # type: ignore
+        ) -> Tuple[Tensor, BakaNetState]:
 
         n_batch, n_seq, n_dim = input.shape
         # Del unused vars to calm down my editor's LSP
@@ -368,7 +377,7 @@ class BakaNet(nn.Module):
 
         # Prepare placeholder for past state if nothing was provided
         if old_states is None:
-            old_states = [None for _ in range(self.config.n_layers)] #type: ignore
+            old_states = BakaNetState(self.config.n_layers)
 
 
         # Prepare outputs for each chunk
@@ -376,7 +385,7 @@ class BakaNet(nn.Module):
         # Move in context left to right
         for pos in range(0, n_seq, self.config.n_ctx):
             # Prepare this step state
-            states = [BakaState(input=None) for _ in range(self.config.n_layers)]
+            states = BakaNetState(self.config.n_layers)
 
             # pass input from the current context window
             states[0].input = input[:, pos:pos+self.config.n_ctx, :]
@@ -407,21 +416,21 @@ class BakaNet(nn.Module):
             outputs.append(output)
 
             # Shift current states into old states
-            old_states: list[BakaState] = states #type: ignore
+            old_states = states
 
             # Detach older states completely
             for state in old_states:
                 state.past_state = None
 
         outputs = torch.cat(outputs, 1)
-        return outputs, old_states or [] # type: ignore
+        return outputs, old_states
 
 
 @dataclass
 class BakaCausalLMOutput:
     logits: Tensor
     loss: Optional[Tensor] = None
-    states: Optional[BakaState] = None
+    states: Optional[BakaLayerState] = None
 
 
 class BakaNetCausalLM(nn.Module):
@@ -440,7 +449,7 @@ class BakaNetCausalLM(nn.Module):
                 input_ids: LongTensor,
                 labels: Optional[LongTensor] = None,
                 attention_mask="ignored",
-                old_states: Optional[list[BakaState]] = None
+                old_states: Optional[list[BakaLayerState]] = None
                 ):
         del attention_mask # not used
         y = self.vocab_in(input_ids)
@@ -481,10 +490,10 @@ def gen_model_path(project, model):
     return model_path
 
 
-def propogate_past_states(past: Optional[list[BakaState]], mb: MiniBatch, detach=False):
+def propogate_past_states(past: Optional[BakaNetState], mb: MiniBatch, detach=False):
     if not past:
         return
-    keys = list(dataclasses.asdict(BakaState()).keys())
+    keys = list(dataclasses.asdict(BakaLayerState()).keys())
     KEYS_TO_IGNORE = ["past_state", "kv_caches",
                       "pauses_pos", "rmt"]
 
@@ -510,7 +519,7 @@ def propogate_past_states(past: Optional[list[BakaState]], mb: MiniBatch, detach
             kv.v_cache = process_tensor(kv.v_cache)
 
 def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=0, detach_at = 0, write_log=None):
-    past = None
+    past: Optional[BakaNetState] = None
 
     for i, mb in enumerate(batch_iterator(batch,
                                           n_ctx=training_ctx_size,
