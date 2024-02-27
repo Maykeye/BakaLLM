@@ -60,7 +60,7 @@ class BakaLayerState:
     kv_caches: list[KVCache] = dataclasses.field(default_factory=list)
 
     pauses_pos: Optional[list[int]] = None
-    rmt: Optional[BakaRMTState] = None
+    rmt: BakaRMTState = dataclasses.field(default_factory=BakaRMTState)
     @property
     def n_seq(self):
         assert self.input is not None
