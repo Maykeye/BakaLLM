@@ -72,7 +72,6 @@ class BakaConfig:
     n_vocab: int = 32000
     n_ctx: int = 512
     n_pauses: int = 8
-    mamba_each_nth_layer: int = 2
     is_pause_pos_random: bool = False
     n_rmt_tokens: int = 16
     n_rmt_margins: int = 0
@@ -95,7 +94,6 @@ def make_config(tokenizer):
         dim_model=768,
         dim_ff=3072,
         n_heads=12,
-        mamba_each_nth_layer=1,
         n_layers=8,
         n_vocab=len(tokenizer))
     return cfg
@@ -218,7 +216,7 @@ class BakaAttention(nn.Module):
         return q, k, v
 
 class BakaMamba(nn.Module):
-    """ Mamba with residual """
+    """ Mamba with normalization """
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.norm_in = nn.LayerNorm(config.dim_model)
@@ -227,7 +225,6 @@ class BakaMamba(nn.Module):
     def forward(self, x: Tensor):
         x_norm = self.norm(x)
         y = self.mamba(x_norm)
-        y = y + x
         return y
 
 class BakaLayer(nn.Module):
@@ -238,9 +235,7 @@ class BakaLayer(nn.Module):
         self.norm_in = nn.LayerNorm(config.dim_model)
         self.attn = BakaAttention(config)
         self.mlp = torch.compile(BakaMLP(config))
-        use_mamba = layer_idx % self.config.mamba_each_nth_layer == 0
-        self.mamba = Mamba(config.dim_model) if use_mamba else None
-        self.norm_mamba = nn.LayerNorm(config.dim_model) if use_mamba else None
+        self.mamba = BakaMamba(config)
 
 
     def forward(self, state: BakaState):
@@ -250,12 +245,8 @@ class BakaLayer(nn.Module):
         attn = self.attn(state)
         mlp = self.mlp(state)
         y = x0 + attn + mlp
-        if self.mamba:
-            x0 = y
-            # TODO: move to separate BakaMamba{Mamba->Norm}?
-            x_mamba = self.norm_mamba(y) # type: ignore
-            y = self.mamba(x_mamba)
-            y = y + x0
+        mamba = self.mamba(y)
+        y = y + mamba
         state.output = y
         return y
 
