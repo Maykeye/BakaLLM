@@ -77,7 +77,7 @@ class BakaConfig:
     n_rmt_tokens: int = 16
     n_rmt_margins: int = 0
     rmt_solidifier: str = "none" # none, glu, mlp, gelephant
-    act_fn: str = "elephant"
+    act_fn: str = "elephant18_fast"
     model_type = "baka_mamba"
     use_flash_attn: bool = True
 
@@ -111,15 +111,33 @@ class BakaElephant(nn.Module):
         state = 1 / (1 + (state / self.a).abs()**self.d)
         return state
 
+class BakaElephant18Fast(nn.Module):
+    # Removed unnecessary a and inlined 8 while at it
+    STATELESS = True
+    def forward(self, state):
+        state = 1 / (1 + (state).abs()**8)
+        return state
 
 BAKA_ACTS = {
-    "elephant": BakaElephant
+    "elephant": BakaElephant,
+    "elephant18_fast": BakaElephant18Fast
 }
 
 
-def make_activation_fn(s):
+
+def make_activation_fn(s:str, _stateless={}):
+    # No need to multiply stateless kernels
+    if fn := _stateless.get(s):
+        return fn
+
     if act := BAKA_ACTS.get(s):
-        return act()
+        fn = act()
+        if s.endswith("_fast"):
+            fn = torch.compile(fn)
+            is_stateless = getattr(type(fn), "STATELESS", False)
+            if is_stateless:
+                _stateless[s] = fn
+        return fn
     return ACT2FN[s]
 
 
@@ -140,83 +158,43 @@ class BakaMLP(nn.Module):
         return y
 
 
-class BakaAttention(nn.Module):
+class BakaAttentionQKVPrep(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
         self.config = config
         self.q = nn.Linear(config.dim_model, config.dim_attn, False)
         self.k = nn.Linear(config.dim_model, config.dim_attn, False)
         self.v = nn.Linear(config.dim_model, config.dim_model, False)
+    def forward(self, x):
+        q = self.q(x)
+        k = self.k(x)
+        v = self.v(x)
+
+        q = rearrange(q, "b t (h f) -> b t h f", h=self.config.n_heads)
+        k = rearrange(k, "b t (h f) -> b t h f", h=self.config.n_heads)
+        v = rearrange(v, "b t (h f) -> b t h f", h=self.config.n_heads)
+        return q, k, v
+
+class BakaAttention(nn.Module):
+    def __init__(self, config: BakaConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.qkv_prep = torch.compile(BakaAttentionQKVPrep(config))
         self.o = nn.Linear(config.dim_model, config.dim_model, False)
         self.rot = RotaryEmbedding(config.dim_head, use_xpos=False)
 
+        assert config.use_flash_attn, "Flash attention required"
+
     def forward(self, state: BakaState):
         q, k, v = self.build_qkv(state)
-
-        if self.config.use_flash_attn:
-            # NB: Flash attention ignores RMT mask
-            y = flash_attn.flash_attn_func(q, k, v, causal=True) 
-        else:
-            is_causal, attn_mask = self.build_attn_mask(state)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, attn_mask=attn_mask)
-
-
-        arrangement = "b t h f" if self.config.use_flash_attn else "b h t f"
-        arrangement += " -> b t (h f)"
-
-        y = rearrange(y, arrangement)
+        y = flash_attn.flash_attn_func(q, k, v, causal=True)
+        y = rearrange(y, "b t h f -> b t (h f)")
         y = self.o(y)
         return y
 
-    def build_attn_mask(self, state: BakaState):
-        # Will not be required in future versions of pytorch, hopefully.
-        # See https://github.com/pytorch/pytorch/issues/108108
-        if state.past_state is None:
-            # No RMT here, which is not really ideal as RMT[-2] will not attend to following RMT[-1],
-            # but it happens only once per sequence
-            return True, None
-        now_n_seq = state.n_seq
-        past_n_seq = state.past_state.n_seq
-
-        # Build a matrix for both past and present
-        # 1 1 1 1  1 1 1
-        # 1 1 1 1  1 1  
-        # 1 1 1 1  1 1 1
-        mask = torch.ones(now_n_seq, now_n_seq + past_n_seq, dtype=torch.bool, device=state.device)
-        # by shifting diagonal we can cut from current chunk only
-        mask = mask.tril_(past_n_seq)
-        # 1 1 1 1  1 0 0
-        # 1 1 1 1  1 1 0
-        # 1 1 1 1  1 1 1
-        if state.rmt:
-            if state.rmt.rhs:
-                # Write RMT memory applies to everything
-                mask[-state.rmt.rhs:] = 1
-            if state.rmt.lhs:
-                # Read RMT memory applies to itself, but not current block unlike the paper["Additionally, we allow all
-                # memory tokens in the read/write block to access all other tokens in the same block. "]:
-                # If model learns top copy first N tokens into first N tokens of RMT-Read, during PPL calculation of these first N tokens, it can easily
-                # cheat and read them, which will be a disaster during the inference
-                # TODO: can be optimized by fusing it into tril_ above
-                mask[:state.rmt.lhs, past_n_seq:past_n_seq+state.rmt.lhs] = 1
-
-        return False, mask
-
     def build_qkv(self, state: BakaState):
-        # project
-
         x = state.input
-        xq = x
-        q = self.q(xq)
-        k = self.k(xq)
-        v = self.v(state.input)
-
-        arrangement = "b t (h f) -> "
-        arrangement += "b t h f" if self.config.use_flash_attn else "b h t f"
-
-        q = rearrange(q, arrangement, h=self.config.n_heads)
-        k = rearrange(k, arrangement, h=self.config.n_heads)
-        v = rearrange(v, arrangement, h=self.config.n_heads)
+        q, k, v = self.qkv_prep(x)
 
         # Cache keys without rotating (temporary?)
         state.k_cache = k
@@ -229,12 +207,12 @@ class BakaAttention(nn.Module):
             past_k = past.k_cache
             past_v = past.v_cache
             assert past_k is not None and past_v is not None
-            seq_dim = -3 if self.config.use_flash_attn else -3
+            seq_dim = -3
             k = torch.cat((past_k, k), seq_dim)
             v = torch.cat((past_v, v), seq_dim)
             current_offset = past.n_seq
 
-        seq_dim = -3 if self.config.use_flash_attn else -2
+        seq_dim = -3
         q = self.rot.rotate_queries_or_keys(q, seq_dim, offset=current_offset)
         k = self.rot.rotate_queries_or_keys(k, seq_dim, offset=past_offset)
         return q, k, v
@@ -259,8 +237,7 @@ class BakaLayer(nn.Module):
         self.layer_idx = layer_idx
         self.norm_in = nn.LayerNorm(config.dim_model)
         self.attn = BakaAttention(config)
-        self.mlp = BakaMLP(config)
-        # TODO: parm me
+        self.mlp = torch.compile(BakaMLP(config))
         use_mamba = layer_idx % self.config.mamba_each_nth_layer == 0
         self.mamba = Mamba(config.dim_model) if use_mamba else None
         self.norm_mamba = nn.LayerNorm(config.dim_model) if use_mamba else None
@@ -574,7 +551,7 @@ def main():
     model = make_model(tokenizer)
     training_ctx_size = 2048
     n_ctx = model.config.n_ctx
-    opt = torch.optim.AdamW(model.parameters())
+    opt = torch.optim.AdamW(model.parameters(), fused=True)
 
     # PATH
     model_path = gen_model_path(project, model)
