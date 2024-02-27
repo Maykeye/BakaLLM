@@ -184,8 +184,14 @@ class BakaAttention(nn.Module):
         assert config.use_flash_attn, "Flash attention required"
 
     def forward(self, state: BakaState):
-        q, k, v = self.build_qkv(state)
-        y = flash_attn.flash_attn_func(q, k, v, causal=True)
+        ys = []
+        for _ in range(1): # group by KV cache length
+            q, k, v = self.build_qkv(state)
+            # y = (B T H F)
+            y = flash_attn.flash_attn_func(q, k, v, causal=True)
+            ys.append(y)
+
+        y = torch.cat(ys, 0)
         y = rearrange(y, "b t h f -> b t (h f)")
         y = self.o(y)
         return y
@@ -222,7 +228,7 @@ class BakaMamba(nn.Module):
         self.mamba = Mamba(config.dim_model)
 
     def forward(self, x: Tensor):
-        x_norm = self.norm(x)
+        x_norm = self.norm_in(x)
         y = self.mamba(x_norm)
         return y
 
