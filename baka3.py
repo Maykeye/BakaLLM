@@ -201,16 +201,15 @@ class BakaAttention(nn.Module):
         past_offset = current_offset = 0
 
         # restore the past
+        seq_dim = -3
         if (past := state.past_state):
             past_k = past.k_cache
             past_v = past.v_cache
             assert past_k is not None and past_v is not None
-            seq_dim = -3
             k = torch.cat((past_k, k), seq_dim)
             v = torch.cat((past_v, v), seq_dim)
             current_offset = past.n_seq
 
-        seq_dim = -3
         q = self.rot.rotate_queries_or_keys(q, seq_dim, offset=current_offset)
         k = self.rot.rotate_queries_or_keys(k, seq_dim, offset=past_offset)
         return q, k, v
