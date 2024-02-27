@@ -37,14 +37,28 @@ class BakaRMTState:
     rhs: int = 0
 
 @dataclass
+class KVCache:
+    def __init__(self, k: Tensor, v: Tensor):
+        self.k_cache = k
+        self.v_cache = v
+        self.seq_dim = -3
+
+    @property
+    def cache_len(self):
+        return self.k_cache.shape[self.seq_dim]
+
+    @property
+    def n_batch(self):
+        return self.k_cache.shape[0]
+
+@dataclass
 class BakaState:
     """ Normalized state of the layer """
     input: Optional[Tensor] = None
     output: Optional[Tensor] = None
-    offset: int = 0
     past_state: Optional["BakaState"] = None  # if this is layer L at current chunk C, this field points to layer (L-1) in chunk (C-1)
-    k_cache: Optional[Tensor] = None
-    v_cache: Optional[Tensor] = None
+    kv_caches: list[KVCache] = dataclasses.field(default_factory=list)
+
     pauses_pos: Optional[list[int]] = None
     rmt: Optional[BakaRMTState] = None
     @property
@@ -184,41 +198,59 @@ class BakaAttention(nn.Module):
         assert config.use_flash_attn, "Flash attention required"
 
     def forward(self, state: BakaState):
+        assert state.input is not None
         ys = []
-        for _ in range(1): # group by KV cache length
-            q, k, v = self.build_qkv(state)
+        caches = []
+
+        # First perform attention on all batches with KV caches
+        bi = 0
+        if state.past_state and len(state.past_state.kv_caches):
+            for past_kv in state.past_state.kv_caches:
+                x = state.input[bi:bi+past_kv.n_batch]
+                bi += past_kv.n_batch
+                q, k, v, cache = self.build_qkv(x, past_kv)
+                # y = (B T H F)
+                y = flash_attn.flash_attn_func(q, k, v, causal=True)
+                ys.append(y)
+                caches.append(cache)
+
+        # Then attend on all batches without KV caches
+        if bi < state.n_batch:
+            x = state.input[bi:]
+            q, k, v, cache = self.build_qkv(x, None)
             # y = (B T H F)
             y = flash_attn.flash_attn_func(q, k, v, causal=True)
             ys.append(y)
+            caches.append(cache)
+
 
         y = torch.cat(ys, 0)
         y = rearrange(y, "b t h f -> b t (h f)")
         y = self.o(y)
+
+        k_caches = torch.cat([cache.k_cache for cache in caches], 0)
+        v_caches = torch.cat([cache.v_cache for cache in caches], 0)
+
+        state.kv_caches = [KVCache(k_caches, v_caches)]
         return y
 
-    def build_qkv(self, state: BakaState):
-        x = state.input
+    def build_qkv(self, x: Tensor, past: Optional[KVCache]):
         q, k, v = self.qkv_prep(x)
 
-        # Cache keys without rotating (temporary?)
-        state.k_cache = k
-        state.v_cache = v
-
-        past_offset = current_offset = 0
+        # Prepare cache of keys and values
+        new_cache = KVCache(k, v)
+        current_offset = 0
 
         # restore the past
         seq_dim = -3
-        if (past := state.past_state):
-            past_k = past.k_cache
-            past_v = past.v_cache
-            assert past_k is not None and past_v is not None
-            k = torch.cat((past_k, k), seq_dim)
-            v = torch.cat((past_v, v), seq_dim)
-            current_offset = past.n_seq
+        if (past and past.cache_len):
+            k = torch.cat((past.k_cache, k), seq_dim)
+            v = torch.cat((past.v_cache, v), seq_dim)
+            current_offset = past.cache_len
 
+        k = self.rot.rotate_queries_or_keys(k, seq_dim, offset=0)
         q = self.rot.rotate_queries_or_keys(q, seq_dim, offset=current_offset)
-        k = self.rot.rotate_queries_or_keys(k, seq_dim, offset=past_offset)
-        return q, k, v
+        return q, k, v, new_cache
 
 class BakaMamba(nn.Module):
     """ Mamba with normalization """
@@ -339,17 +371,12 @@ class BakaNet(nn.Module):
             old_states = [None for _ in range(self.config.n_layers)] #type: ignore
 
 
-        # Calculate the start position from the start position and length of the last chunk (if any)
-        start_pos = 0
-        if old_states[0] is not None:
-            start_pos = old_states[0].offset + old_states[0].n_seq
-
         # Prepare outputs for each chunk
         outputs = []
         # Move in context left to right
         for pos in range(0, n_seq, self.config.n_ctx):
             # Prepare this step state
-            states = [BakaState(input=None, offset=start_pos + pos) for _ in range(self.config.n_layers)]
+            states = [BakaState(input=None) for _ in range(self.config.n_layers)]
 
             # pass input from the current context window
             states[0].input = input[:, pos:pos+self.config.n_ctx, :]
@@ -458,27 +485,29 @@ def propogate_past_states(past: Optional[list[BakaState]], mb: MiniBatch, detach
     if not past:
         return
     keys = list(dataclasses.asdict(BakaState()).keys())
+    KEYS_TO_IGNORE = ["past_state", "kv_caches",
+                      "pauses_pos", "rmt"]
+
+    def process_tensor(t):
+        if detach:
+            t = t.detach()
+        return mb.pass_batch_from_past_to_present(t)
 
     for state in past:
         if not state:
             continue
+        orig_n_batch = state.n_batch # remember number of batches before pruning them
         for k in keys:
-            v = getattr(state, k)
-            if not isinstance(v, torch.Tensor):
+            if k in KEYS_TO_IGNORE:
                 continue
-            v = mb.pass_batch_from_past_to_present(v)
-            if detach:
-                v = v.detach()
-            setattr(state, k, v)
+            v = getattr(state, k)
+            assert isinstance(v, torch.Tensor), f'Unsupported type of {k}: {type(v)}'
+            setattr(state, k, process_tensor(v))
 
-def get_grad_norm(model):
-    total_norm = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-    total_norm = total_norm ** (1. / 2)
-    return total_norm
+        for kv in state.kv_caches:
+            assert kv.n_batch == orig_n_batch, f"KV cache should either doesn't exist or be shared for all batches ({kv.n_batch=}, {orig_n_batch=})"
+            kv.k_cache = process_tensor(kv.k_cache)
+            kv.v_cache = process_tensor(kv.v_cache)
 
 def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=0, detach_at = 0, write_log=None):
     past = None
@@ -510,7 +539,7 @@ def main():
     parser.add_option("-r", "--run", dest="run_id",
                       help="set run id to RUN_ID", metavar="RUN_ID")
     parser.add_option("-w", "--write-log", dest="do_log", action="store_true",
-                      help="enable WANDB log")
+                      help="enable log")
     parser.add_option("-l", "--load", dest="do_load", action="store_true",
                       help="load existing model")
     parser.add_option("-b", "--batch-size", dest="batch_size", default=5, type="int",
