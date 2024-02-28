@@ -35,6 +35,7 @@ def model_numel(m: nn.Module):
 class BakaRMTState:
     lhs: int = 0
     rhs: int = 0
+    rhs_padding: int = 0
 
 @dataclass
 class KVCache:
@@ -60,7 +61,36 @@ class BakaLayerState:
     kv_caches: list[KVCache] = dataclasses.field(default_factory=list)
 
     pauses_pos: Optional[list[int]] = None
-    rmt: BakaRMTState = dataclasses.field(default_factory=BakaRMTState)
+    rmts: list[BakaRMTState] = dataclasses.field(default_factory=list)
+
+
+    def remove_batches(self, remove_batch_ids: list):
+        """ Remove batch with indices from the state """
+        assert isinstance(remove_batch_ids, list)
+
+        all_batch_ids = range(self.n_batch)
+        keep_batch = [x for x in all_batch_ids if x not in remove_batch_ids]
+        keep_batch = torch.tensor(keep_batch, device=self.device)
+
+        self.rmts = [self.rmts[i] for i in all_batch_ids if i not in remove_batch_ids]
+        # self.pause_pos: the same
+        assert len(self.kv_caches) in (0,1), "no kv_caches must exist or all must be groupped together (which is the case after model has been ran)"
+        for kv in self.kv_caches:
+            kv.k_cache = kv.k_cache[keep_batch]
+            kv.v_cache = kv.v_cache[keep_batch]
+        assert self.past_state is None, "Can't remove batches with past-states still attached"
+        if self.output is not None:
+            self.output = self.output[keep_batch]
+        if self.input is not None:
+            self.input = self.input[keep_batch]
+
+
+    def calc_rmt_cutoff(self):
+        return sum((rmt.rhs_padding == 0) for rmt in self.rmts)
+
+
+
+
     @property
     def n_seq(self):
         assert self.input is not None
@@ -75,6 +105,11 @@ class BakaLayerState:
         assert self.input is not None
         return self.input.device
 
+        
+
+
+
+
 class BakaNetState:
     def __init__(self, n_layers):
         self.layers = [BakaLayerState() for _ in range(n_layers)]
@@ -84,6 +119,15 @@ class BakaNetState:
 
     def __iter__(self):
         return iter(self.layers)
+
+    def remove_batches(self, remove_batch_ids: list[int]):
+        """ Remove batch with indices from the state """
+        if not remove_batch_ids: 
+            return
+        assert isinstance(remove_batch_ids, list)
+        for layer in self.layers:
+            layer.remove_batches(remove_batch_ids)
+    
 
 
 @dataclass
@@ -96,7 +140,6 @@ class BakaConfig:
     n_vocab: int = 32000
     n_ctx: int = 512
     n_pauses: int = 8
-    is_pause_pos_random: bool = False
     n_rmt_tokens: int = 16
     n_rmt_margins: int = 0
     rmt_solidifier: str = "none" # none, glu, mlp, gelephant
@@ -196,6 +239,7 @@ class BakaAttentionQKVPrep(nn.Module):
         v = rearrange(v, "b t (h f) -> b t h f", h=self.config.n_heads)
         return q, k, v
 
+
 class BakaAttention(nn.Module):
     def __init__(self, config: BakaConfig) -> None:
         super().__init__()
@@ -210,6 +254,7 @@ class BakaAttention(nn.Module):
         assert state.input is not None
         ys = []
         caches = []
+
 
         # First perform attention on all batches with KV caches
         bi = 0
@@ -273,6 +318,7 @@ class BakaMamba(nn.Module):
         y = self.mamba(x_norm)
         return y
 
+
 class BakaLayer(nn.Module):
     def __init__(self, config: BakaConfig, layer_idx: int) -> None:
         super().__init__()
@@ -296,6 +342,17 @@ class BakaLayer(nn.Module):
         state.output = y
         return y
 
+def maybe_cat(a, b, dim):
+    """ Torch.Cat, but if one operand has 0-size, return the other operand.
+    The difference from torch.cat is that cat((0, N, M), (10, N+1, M), 0) will cause error in torch.cat as dimensions mismatch.
+    We don't check dimensions in that case
+    """
+    if a.shape[dim] and b.shape[dim]:
+        return torch.cat((a, b), dim)
+    elif a.shape[dim]:
+        return a
+    return b
+
 
 class BakaRMT(nn.Module):
     def __init__(self, config: BakaConfig):
@@ -303,26 +360,89 @@ class BakaRMT(nn.Module):
         self.config = config
         self.rmt_tokens = nn.Parameter(torch.randn(config.n_rmt_tokens, config.dim_model))
 
-    def inject(self, current_start: BakaLayerState, last_end: BakaLayerState) -> BakaRMTState:
+    def inject(self, current_start: BakaLayerState, last_end: BakaLayerState):
         assert current_start.input is not None
         assert last_end is not None
 
-        if last_end.output is not None:
-            assert last_end.rmt is not None
-            lhs = rhs = last_end.output[:, -last_end.rmt.rhs:]
-            current_start.input = torch.cat((lhs, current_start.input, rhs), 1)
-            return BakaRMTState(lhs=lhs.shape[1], rhs=rhs.shape[1])
+        if last_end.output is None:
+            # No last output at all - inject [WRITE] cells only
+            rhs = self.rmt_tokens.repeat(current_start.n_batch, 1, 1)
+            current_start.input = torch.cat((current_start.input, rhs), 1)
+            current_start.rmts = [BakaRMTState(lhs=0, rhs=rhs.shape[1]) for _ in range(current_start.n_batch)]
+            return
 
-        rhs = self.rmt_tokens.repeat(current_start.n_batch, 1, 1)
-        current_start.input = torch.cat((current_start.input, rhs), 1)
-        return BakaRMTState(lhs=0, rhs=rhs.shape[1])
 
-    def detach(self, x: Tensor, state: BakaRMTState):
-        if state.lhs:
-            x = x[:, state.lhs:]
-        if state.rhs:
-            x = x[:, :-state.rhs]
-        return x
+        # New layers, if any, should always be appended to the end
+        n_batch_with_rmt = len(last_end.rmts) 
+        rest_batches = current_start.n_batch - n_batch_with_rmt
+        assert n_batch_with_rmt > 0
+        
+        # assert that output RMT is consistent with output's n_batch
+        assert n_batch_with_rmt == last_end.output.shape[0], f"{n_batch_with_rmt=} != {last_end.output.shape[0]=}"
+        
+        # check that all RMTs have the same number of [WRITE] cells (we are not interested in [READ] cells)
+        expected_rhs = last_end.rmts[0].rhs 
+        rmt_valid = all(rmt.rhs == expected_rhs for rmt in last_end.rmts[1:])
+        assert rmt_valid, "Inconsisted RMT"
+        
+        # TODO:
+        # 1. Copy WRITE-MEM from the past
+        n_padless_rmts = last_end.calc_rmt_cutoff()
+        assert n_padless_rmts <= n_batch_with_rmt, "PAST output size mismatch with CURRENT input size"
+
+
+        mem_from_unpadded = self.get_rhs(last_end.output[:n_padless_rmts], last_end.rmts[0])
+        mem_from_padded = self.get_rhs(last_end.output[n_padless_rmts:], last_end.rmts[-1])
+        mem = maybe_cat(mem_from_unpadded, mem_from_padded, 0)
+        input_with_rmt = torch.cat((mem, current_start.input[:n_batch_with_rmt], mem), 1)
+
+
+        # 2. Copy default write MEM to the rest of batches that have no RMT
+        rhs = self.rmt_tokens.repeat(rest_batches, 1, 1)
+        padding = torch.zeros_like(rhs)
+        input_without_rmt = torch.cat((current_start.input[n_batch_with_rmt:], rhs, padding), 1)
+        current_start.rmts = [BakaRMTState(lhs=mem.shape[1], rhs=mem.shape[1]) for _ in range(n_batch_with_rmt)]
+        current_start.rmts.extend([
+            BakaRMTState(lhs=0, 
+                         rhs=rhs.shape[1],
+                         rhs_padding=padding.shape[1]) 
+            for _ in range(rest_batches)
+        ])
+        current_start.input = torch.cat((input_with_rmt, input_without_rmt), 0)
+
+    def get_rhs(self, x: Tensor, rmt: BakaRMTState):
+        len_tail = rmt.rhs_padding + rmt.rhs
+        tail = x[:, :len_tail]
+        tail = x[:, :rmt.rhs]
+        return tail
+        
+
+
+    def detach(self, x: Tensor, output_layer_state: BakaLayerState):        
+        n_full_rmt_batches = output_layer_state.calc_rmt_cutoff()
+
+        rmt_head = output_layer_state.rmts[0]
+        rmt_tail = output_layer_state.rmts[-1]
+
+        # HEAD
+        head = x[:n_full_rmt_batches]
+        head = head[:, rmt_head.lhs:]
+        if rmt_head.rhs: 
+            head = head[:, :-rmt_head.rhs]
+        
+        # TAIL
+        tail = x[n_full_rmt_batches:]
+        # LHS is 0 at tail, but we still need to take it into account
+        # as if tail is absent, rhs_padding=0, lhs!=0 and tails' n_seq still must match in n_seq even if its n_batch=0
+        tail = tail[:, rmt_tail.lhs:] 
+        if rmt_tail.rhs_padding:
+            tail = tail[:, :-rmt_tail.rhs_padding]
+        if rmt_tail.rhs:
+            tail = tail[:, :-rmt_tail.rhs]
+
+        y = torch.cat((head, tail), 0)
+        return y
+
 
 
 class BakaPause(nn.Module):
@@ -333,15 +453,9 @@ class BakaPause(nn.Module):
 
     def inject(self, state:BakaLayerState):
         assert state.input is not None
-        def rand_pos(n) -> int:
-            return int(torch.randint(1, n+1, (1,)).item())
-
         # first pos is fixed to zero to emulate BOS
-        if self.config.is_pause_pos_random:
-            state.pauses_pos = [0] + [rand_pos(state.n_seq + i) for i in range(1, self.config.n_pauses)]
-        else:
-            step = self.config.n_ctx // (self.config.n_pauses)
-            state.pauses_pos = [step * i for i in range(self.config.n_pauses) if step*i <= state.n_seq]
+        step = self.config.n_ctx // (self.config.n_pauses)
+        state.pauses_pos = [step * i for i in range(self.config.n_pauses) if step*i <= state.n_seq]
 
         pause_emb = self.pause_emb.repeat(state.n_batch, 1, 1)
         x = state.input
@@ -362,8 +476,8 @@ class BakaNet(nn.Module):
         self.layers = nn.ModuleList([
             BakaLayer(config, j) for j in range(config.n_layers)
         ])
-        self.pause = BakaPause(config)
-        self.rmt = BakaRMT(config)
+        self.pause = BakaPause(config) if config.n_pauses else None
+        self.rmt = BakaRMT(config) if config.n_rmt_tokens else None
 
     def forward(self,
                 input: Tensor,
@@ -388,17 +502,18 @@ class BakaNet(nn.Module):
             states = BakaNetState(self.config.n_layers)
 
             # pass input from the current context window
-            states[0].input = input[:, pos:pos+self.config.n_ctx, :]
-            self.pause.inject(states[0])
-            rmt_state = self.rmt.inject(states[0], old_states[-1])
-            states[0].rmt = rmt_state
+            states[0].input = input[:, pos:pos+self.config.n_ctx, :]            
+            if self.pause:
+                self.pause.inject(states[0])
+            if self.rmt:
+                self.rmt.inject(states[0], old_states[-1])
 
             # Move in the model top to bottom
             for i, layer in enumerate(self.layers):
                 # Link current state to the past state
                 states[i].past_state = old_states[i]
                 states[i].pauses_pos = states[0].pauses_pos
-                states[i].rmt = states[0].rmt
+                states[i].rmts = states[0].rmts
 
                 # Link output of the intermediate layer to input of the next intermediate layer
                 if i:
@@ -408,11 +523,13 @@ class BakaNet(nn.Module):
                 layer(states[i])
 
             assert states[-1].output is not None
-            assert states[-1].pauses_pos is not None
             # Last layer represents everything we know so far, which is more than necessary
             # To get output, useable for loss calc, we need to remove pauses, RMT, etc
-            output = self.rmt.detach(states[-1].output, rmt_state)
-            output = self.pause.removed(output, states[-1].pauses_pos)
+            output = states[-1].output
+            if self.rmt:
+                output = self.rmt.detach(output, states[-1])
+            if self.pause:
+                output = self.pause.removed(output, states[-1].pauses_pos)
             outputs.append(output)
 
             # Shift current states into old states
@@ -430,7 +547,7 @@ class BakaNet(nn.Module):
 class BakaCausalLMOutput:
     logits: Tensor
     loss: Optional[Tensor] = None
-    states: Optional[BakaLayerState] = None
+    states: Optional[BakaNetState] = None
 
 
 class BakaNetCausalLM(nn.Module):
@@ -449,7 +566,7 @@ class BakaNetCausalLM(nn.Module):
                 input_ids: LongTensor,
                 labels: Optional[LongTensor] = None,
                 attention_mask="ignored",
-                old_states: Optional[list[BakaLayerState]] = None
+                old_states: Optional[BakaNetState] = None
                 ):
         del attention_mask # not used
         y = self.vocab_in(input_ids)
@@ -462,9 +579,6 @@ class BakaNetCausalLM(nn.Module):
             y_true = rearrange(labels[:, 1:], 'b t -> (b t)')
             loss = F.cross_entropy(y_pred, y_true)
         return BakaCausalLMOutput(loss=loss, logits=y, states=states)
-
-
-WANDB_INITED = False
 
 
 def try_load(obj, path):
@@ -495,7 +609,7 @@ def propogate_past_states(past: Optional[BakaNetState], mb: MiniBatch, detach=Fa
         return
     keys = list(dataclasses.asdict(BakaLayerState()).keys())
     KEYS_TO_IGNORE = ["past_state", "kv_caches",
-                      "pauses_pos", "rmt"]
+                      "pauses_pos", "rmts"]
 
     def process_tensor(t):
         if detach:
@@ -517,6 +631,54 @@ def propogate_past_states(past: Optional[BakaNetState], mb: MiniBatch, detach=Fa
             assert kv.n_batch == orig_n_batch, f"KV cache should either doesn't exist or be shared for all batches ({kv.n_batch=}, {orig_n_batch=})"
             kv.k_cache = process_tensor(kv.k_cache)
             kv.v_cache = process_tensor(kv.v_cache)
+        
+        # (B, 1)
+        rmt_indices_to_keep = torch.arange(orig_n_batch, device=state.device).view(-1, 1)
+        # (B', 1)
+        rmt_indices_to_keep = mb.pass_batch_from_past_to_present(rmt_indices_to_keep).detach().cpu().flatten().tolist()
+        state.rmts = [state.rmts[i] for i in rmt_indices_to_keep]
+
+print("\n\nMaking sample model")
+set_seed(123)
+cfg = BakaConfig(n_layers=2, dim_model=4, dim_ff=1, n_vocab=10, n_heads=1, n_ctx=64, n_rmt_tokens=1, n_pauses=0)
+m = BakaNetCausalLM(cfg).bfloat16().cuda()
+for p in m.parameters():
+    p.data *= 0.1
+
+N=128
+
+batch = torch.randint(10, (5, 256)).cuda()
+
+print(">> x_vanilla2_a")
+x_vanilla2_a = batch[torch.tensor([1]).cuda()][:, 128:128+N]
+y_vanilla2_b = m(x_vanilla2_a)
+#del DEBUG_LAYER[ENABLE_DEBUG]
+
+print(">> x_in_batch_a")
+x_in_batch_a = batch[torch.tensor([0,2]).cuda()][:, :N]
+y_in_batch_a = m(x_in_batch_a)
+
+print(">> x_in_batch_b")
+x_in_batch_b = batch[torch.tensor([0,2,1]).cuda()][:, 128:128+N]
+y_in_batch_b = m(x_in_batch_b, old_states=y_in_batch_a.states)
+
+A = y_vanilla2_b.logits[-1]
+B = y_in_batch_b.logits[-1]
+assert torch.allclose(A, B)
+###########################################
+x_in_batch_aa = batch[torch.tensor([0,2]).cuda()][:, :N]
+y_in_batch_aa = m(x_in_batch_aa)
+x_in_batch_ab = batch[torch.tensor([0,2]).cuda()][:, 128:128+N]
+y_in_batch_ab = m(x_in_batch_ab, old_states=y_in_batch_aa.states)
+A = y_in_batch_b.logits[0]
+B = y_in_batch_ab.logits[0]
+assert torch.allclose(A, B)
+A = y_in_batch_b.logits[1]
+B = y_in_batch_ab.logits[1]
+assert torch.allclose(A, B)
+
+print("ALL CLEAR")
+quit()
 
 def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=0, detach_at = 0, write_log=None):
     past: Optional[BakaNetState] = None
