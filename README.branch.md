@@ -1,14 +1,33 @@
 # BakaLLM: Sssnake, Ssssnake! (But faster)
 
-L8B8: Added  bunch of torch.compile. This saves memory a lot and allowed to run BS=8.
+* L8B8: Added  bunch of torch.compile. This saves memory a lot and allowed to run BS=8.
 Unfortunately halving number of batches reduced overall performance to the level comparable with L12B5.
 
-TODO:
-During testing it was noticed that unless model is initialized with parms *0.10 at least (or smaller),
-y123 = ATTN([b1, b2, b3]) for three batches gives different resuls from y13=ATTN(b1,b3) for y1/y3
-Need to fix it in initialization
+* L8B8D: Added dynamically built batches. 
+
+Previously batches were "static" and "statically" split to minibatches.
+E.g. if we have document D1=ABCDEFGHWX, D2=IJKLM, D3=NOPQR, with bach size = 2, ctx size = 4,
+first batch would be
+
+[ABCD, IJKL] then [EFGH, M___] (padding), then [WX] (end of D1)
+
+Now system keeps track of finished batches and appends new documents:
+
+[ABCD, IJKL] then [EFGH, M___] (padding), then [WX__, NOPQ] (end of D2 ended, so it was replaced by D3)
+
+This massively improved performance. I got 3.77 after 1 epoch. Also definition of epoch was changed.
+Previously 1 epoch ran over each document twice: one as usual, then with an offset n_ctx / 2.
+Now only one pass is done per epoch. Originally I wanted to do both, but it worked so well, I now don't want to,
+
+Also training became much "smoother". Previously loss jumped up and down as number of batches changed.
+Now it improves steadily
 
 ## Training
+(Scores are produced by bench.py, ie its validation split)
+
+Mamba L8B8D: E1: 3.77266 (8 layers, with dynamic batches)
+
+
 Mamba L8B8 E1:  4.26901 (8 layers w. mamba, 8 per batch for training)
            E2:  3.98698
            E3:  3.88880

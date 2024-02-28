@@ -4,7 +4,7 @@ from tqdm.auto import tqdm
 import os
 from transformers.activations import ACT2FN
 import torch
-from typing import Tuple
+from typing import Any, Tuple
 from torch import LongTensor, Tensor
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,7 +16,7 @@ from typing import Optional
 
 from rotary_embedding_torch import RotaryEmbedding
 import mmh3
-from bakadata import get_dl, get_tokenizer, batch_iterator, MiniBatch
+from bakadata import get_dl, get_tokenizer, MiniBatch
 from float_logger import flog
 from transformers import set_seed
 
@@ -71,6 +71,7 @@ class BakaLayerState:
         all_batch_ids = range(self.n_batch)
         keep_batch = [x for x in all_batch_ids if x not in remove_batch_ids]
         keep_batch = torch.tensor(keep_batch, device=self.device)
+        assert len(keep_batch), "If no batches supposed to be kept, recreate state from the scratch"
 
         self.rmts = [self.rmts[i] for i in all_batch_ids if i not in remove_batch_ids]
         # self.pause_pos: the same
@@ -105,7 +106,7 @@ class BakaLayerState:
         assert self.input is not None
         return self.input.device
 
-        
+
 
 
 
@@ -122,12 +123,12 @@ class BakaNetState:
 
     def remove_batches(self, remove_batch_ids: list[int]):
         """ Remove batch with indices from the state """
-        if not remove_batch_ids: 
+        if not remove_batch_ids:
             return
         assert isinstance(remove_batch_ids, list)
         for layer in self.layers:
             layer.remove_batches(remove_batch_ids)
-    
+
 
 
 @dataclass
@@ -373,18 +374,18 @@ class BakaRMT(nn.Module):
 
 
         # New layers, if any, should always be appended to the end
-        n_batch_with_rmt = len(last_end.rmts) 
+        n_batch_with_rmt = len(last_end.rmts)
         rest_batches = current_start.n_batch - n_batch_with_rmt
         assert n_batch_with_rmt > 0
-        
+
         # assert that output RMT is consistent with output's n_batch
         assert n_batch_with_rmt == last_end.output.shape[0], f"{n_batch_with_rmt=} != {last_end.output.shape[0]=}"
-        
+
         # check that all RMTs have the same number of [WRITE] cells (we are not interested in [READ] cells)
-        expected_rhs = last_end.rmts[0].rhs 
+        expected_rhs = last_end.rmts[0].rhs
         rmt_valid = all(rmt.rhs == expected_rhs for rmt in last_end.rmts[1:])
         assert rmt_valid, "Inconsisted RMT"
-        
+
         # TODO:
         # 1. Copy WRITE-MEM from the past
         n_padless_rmts = last_end.calc_rmt_cutoff()
@@ -403,9 +404,9 @@ class BakaRMT(nn.Module):
         input_without_rmt = torch.cat((current_start.input[n_batch_with_rmt:], rhs, padding), 1)
         current_start.rmts = [BakaRMTState(lhs=mem.shape[1], rhs=mem.shape[1]) for _ in range(n_batch_with_rmt)]
         current_start.rmts.extend([
-            BakaRMTState(lhs=0, 
+            BakaRMTState(lhs=0,
                          rhs=rhs.shape[1],
-                         rhs_padding=padding.shape[1]) 
+                         rhs_padding=padding.shape[1])
             for _ in range(rest_batches)
         ])
         current_start.input = torch.cat((input_with_rmt, input_without_rmt), 0)
@@ -415,10 +416,10 @@ class BakaRMT(nn.Module):
         tail = x[:, :len_tail]
         tail = x[:, :rmt.rhs]
         return tail
-        
 
 
-    def detach(self, x: Tensor, output_layer_state: BakaLayerState):        
+
+    def detach(self, x: Tensor, output_layer_state: BakaLayerState):
         n_full_rmt_batches = output_layer_state.calc_rmt_cutoff()
 
         rmt_head = output_layer_state.rmts[0]
@@ -427,14 +428,14 @@ class BakaRMT(nn.Module):
         # HEAD
         head = x[:n_full_rmt_batches]
         head = head[:, rmt_head.lhs:]
-        if rmt_head.rhs: 
+        if rmt_head.rhs:
             head = head[:, :-rmt_head.rhs]
-        
+
         # TAIL
         tail = x[n_full_rmt_batches:]
         # LHS is 0 at tail, but we still need to take it into account
         # as if tail is absent, rhs_padding=0, lhs!=0 and tails' n_seq still must match in n_seq even if its n_batch=0
-        tail = tail[:, rmt_tail.lhs:] 
+        tail = tail[:, rmt_tail.lhs:]
         if rmt_tail.rhs_padding:
             tail = tail[:, :-rmt_tail.rhs_padding]
         if rmt_tail.rhs:
@@ -502,7 +503,7 @@ class BakaNet(nn.Module):
             states = BakaNetState(self.config.n_layers)
 
             # pass input from the current context window
-            states[0].input = input[:, pos:pos+self.config.n_ctx, :]            
+            states[0].input = input[:, pos:pos+self.config.n_ctx, :]
             if self.pause:
                 self.pause.inject(states[0])
             if self.rmt:
@@ -604,93 +605,58 @@ def gen_model_path(project, model):
     return model_path
 
 
-def propogate_past_states(past: Optional[BakaNetState], mb: MiniBatch, detach=False):
-    if not past:
-        return
-    keys = list(dataclasses.asdict(BakaLayerState()).keys())
-    KEYS_TO_IGNORE = ["past_state", "kv_caches",
-                      "pauses_pos", "rmts"]
-
-    def process_tensor(t):
-        if detach:
-            t = t.detach()
-        return mb.pass_batch_from_past_to_present(t)
-
-    for state in past:
-        if not state:
-            continue
-        orig_n_batch = state.n_batch # remember number of batches before pruning them
-        for k in keys:
-            if k in KEYS_TO_IGNORE:
-                continue
-            v = getattr(state, k)
-            assert isinstance(v, torch.Tensor), f'Unsupported type of {k}: {type(v)}'
-            setattr(state, k, process_tensor(v))
-
-        for kv in state.kv_caches:
-            assert kv.n_batch == orig_n_batch, f"KV cache should either doesn't exist or be shared for all batches ({kv.n_batch=}, {orig_n_batch=})"
-            kv.k_cache = process_tensor(kv.k_cache)
-            kv.v_cache = process_tensor(kv.v_cache)
-        
-        # (B, 1)
-        rmt_indices_to_keep = torch.arange(orig_n_batch, device=state.device).view(-1, 1)
-        # (B', 1)
-        rmt_indices_to_keep = mb.pass_batch_from_past_to_present(rmt_indices_to_keep).detach().cpu().flatten().tolist()
-        state.rmts = [state.rmts[i] for i in rmt_indices_to_keep]
-
-print("\n\nMaking sample model")
-set_seed(123)
-cfg = BakaConfig(n_layers=2, dim_model=4, dim_ff=1, n_vocab=10, n_heads=1, n_ctx=64, n_rmt_tokens=1, n_pauses=0)
-m = BakaNetCausalLM(cfg).bfloat16().cuda()
-for p in m.parameters():
-    p.data *= 0.1
-
-N=128
-
-batch = torch.randint(10, (5, 256)).cuda()
-
-print(">> x_vanilla2_a")
-x_vanilla2_a = batch[torch.tensor([1]).cuda()][:, 128:128+N]
-y_vanilla2_b = m(x_vanilla2_a)
-#del DEBUG_LAYER[ENABLE_DEBUG]
-
-print(">> x_in_batch_a")
-x_in_batch_a = batch[torch.tensor([0,2]).cuda()][:, :N]
-y_in_batch_a = m(x_in_batch_a)
-
-print(">> x_in_batch_b")
-x_in_batch_b = batch[torch.tensor([0,2,1]).cuda()][:, 128:128+N]
-y_in_batch_b = m(x_in_batch_b, old_states=y_in_batch_a.states)
-
-A = y_vanilla2_b.logits[-1]
-B = y_in_batch_b.logits[-1]
-assert torch.allclose(A, B)
-###########################################
-x_in_batch_aa = batch[torch.tensor([0,2]).cuda()][:, :N]
-y_in_batch_aa = m(x_in_batch_aa)
-x_in_batch_ab = batch[torch.tensor([0,2]).cuda()][:, 128:128+N]
-y_in_batch_ab = m(x_in_batch_ab, old_states=y_in_batch_aa.states)
-A = y_in_batch_b.logits[0]
-B = y_in_batch_ab.logits[0]
-assert torch.allclose(A, B)
-A = y_in_batch_b.logits[1]
-B = y_in_batch_ab.logits[1]
-assert torch.allclose(A, B)
-
-print("ALL CLEAR")
-quit()
-
-def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_first=0, detach_at = 0, write_log=None):
+def train_with_dynamic_batches(model, tokenizer, batch_sampler, n_ctx, bs, opt, clip, write_log):
+    has_more_batches = True
+    inputs: list[Tensor] = []
     past: Optional[BakaNetState] = None
 
-    for i, mb in enumerate(batch_iterator(batch,
-                                          n_ctx=training_ctx_size,
-                                          n_stride=training_ctx_size,
-                                          tokenizer=tokenizer,
-                                          n_skip_first=n_skip_first)):
-        should_detach = detach_at != 0 and i % detach_at == 0
-        past = propogate_past_states(past, mb, detach=should_detach)
-        out = model(input_ids=mb.input_ids, labels=mb.labels, old_states=past)
+    while True:
+        # Advance existing documents and mark finished batches for removal
+        del_me = []
+        for i in reversed(range(len(inputs))):
+            inputs[i] = inputs[i][:, n_ctx:]
+            if inputs[i].shape[1] == 0:
+                del_me.append(i)
+
+        # Remove finished batches
+        if len(del_me) == len(inputs):
+            past = None
+            inputs = []
+        else:
+            for i in del_me:
+                if past is not None:
+                    past.remove_batches([i])
+                # safe to delete since I is iteratin in reverse
+                del inputs[i]
+
+        # Add new batches
+        while len(inputs) < bs and has_more_batches:
+            try:
+                b_inputs = next(batch_sampler)
+                inputs.append(b_inputs)
+            except StopIteration:
+                has_more_batches = False
+                break
+        # Build batch for training step
+        x_inputs = []
+        x_labels = []
+        for b_inputs in inputs:
+            b_labels = b_inputs = b_inputs[:, :n_ctx]
+
+            n_padding = n_ctx - b_inputs.shape[1]
+            b_input = F.pad(b_inputs, (0, n_padding), "constant", value=tokenizer.pad_token_id)
+            b_labels = F.pad(b_labels, (0, n_padding), "constant", value=-100)
+
+            x_inputs.append(b_input)
+            x_labels.append(b_labels)
+        if not x_inputs:
+            return
+        x_inputs = torch.cat(x_inputs, 0).clone().cuda()
+        x_labels = torch.cat(x_labels, 0).clone().cuda()
+
+        # Do step
+        #out = model(input_ids=x_inputs, labels=x_labels, old_states=past)
+        out = model(input_ids=x_inputs, labels=x_labels)
         past = out.states
         loss = out.loss
         loss.backward()
@@ -699,9 +665,10 @@ def train_batch(model, tokenizer, batch, training_ctx_size, opt, clip, n_skip_fi
         opt.step()
         opt.zero_grad()
         if write_log:
-            write_log(loss, mb)
+            write_log(loss)
 
 
+TQDM_GLOBAL_BAR: Any = None
 def main():
     set_seed(9)
     parser = optparse.OptionParser()
@@ -713,13 +680,12 @@ def main():
                       help="enable log")
     parser.add_option("-l", "--load", dest="do_load", action="store_true",
                       help="load existing model")
-    parser.add_option("-b", "--batch-size", dest="batch_size", default=5, type="int",
-                      help="do not save the progress(default: save)")
+    parser.add_option("-b", "--batch-size", dest="batch_size", default=5, type="int", metavar="BS",
+                      help="batch size: keep batch filled with BS documents all the time")
     parser.add_option("-s", "--skip", dest="skip", type="int", metavar="N", default=0,
                       help="skip N batches")
     parser.add_option("-S", "--no-save", dest="do_save", action="store_false", default=True,
                       help="do not save the progress(default: save)")
-    parser.add_option("-d", "--detach", metavar="N", help="stop gradient after N steps", type="int", default=8)
 
     debug_args = None
     if sys.gettrace():
@@ -735,18 +701,16 @@ def main():
     do_load: bool = options.do_load
     do_save: bool = options.do_save or do_load
     batch_size: int = options.batch_size
-    detach_at: int = options.detach
 
     assert project, "project name is required"
     assert run_id, "run id is required"
     tokenizer = get_tokenizer()
-    dl = get_dl(tokenizer, batch_size=batch_size, n_skip_batches=options.skip)
+    dl = get_dl(tokenizer, batch_size=1, n_skip_batches=options.skip)
 
     clip = 0.5
 
     model = make_model(tokenizer)
     training_ctx_size = 2048
-    n_ctx = model.config.n_ctx
     opt = torch.optim.AdamW(model.parameters(), fused=True)
 
     # PATH
@@ -760,23 +724,22 @@ def main():
     if do_load:
         try_load(model, model_path)
         try_load(opt, opt_path)
+    else:
+        print("*** Model is created from SCRATCH")
 
-
-
-    def write_log(loss: Tensor, mb: MiniBatch):
-        bar.set_description(f'L:{loss.item():.4f}, P:{mb.progress:%}x{mb.n_batch} (len:{mb.seqtotal})')
+    def write_log(loss: Tensor):
+        global TQDM_GLOBAL_BAR
+        TQDM_GLOBAL_BAR.set_description(f'L:{loss.item():.4f}')
         if do_log:
             my_log(loss=loss.item(), project=f"baka3-{project}", run_id=run_id)
 
-    for i_batch, batch in enumerate(bar := tqdm(dl)):
-        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip,
-                    n_skip_first=0, detach_at=detach_at, write_log=write_log)
-        train_batch(model, tokenizer, batch, training_ctx_size, opt, clip,
-                    n_skip_first=n_ctx//2, detach_at=detach_at, write_log=write_log)
+    def batch_sampler(n_skip=0):
+        global TQDM_GLOBAL_BAR
+        TQDM_GLOBAL_BAR = tqdm(dl)
+        for b in TQDM_GLOBAL_BAR:
+            yield b["input_ids"][:, n_skip:]
 
-        if do_save and i_batch and i_batch % 50 == 0:
-            torch.save(model.state_dict(), model_path)
-            torch.save(opt.state_dict(), opt_path)
+    train_with_dynamic_batches(model, tokenizer, batch_sampler(0), training_ctx_size, batch_size, opt, clip, write_log)
 
     if do_save:
         torch.save(model.state_dict(), model_path)
