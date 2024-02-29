@@ -26,7 +26,11 @@ Now it improves steadily
 (Scores are produced by bench.py, ie its validation split)
 
 Mamba L8B8D: E1: 3.77266 (8 layers, with dynamic batches)
-
+             E2: 3.47578
+             E3: 3.36562 (Pythia 70m/Cerebras 111M have around 3.5xxx loss)
+             E4: 3.30104 (Cerebras-GPT-256M is 3.20763)
+             E5: 3.26393
+             E6: 3.23828
 
 Mamba L8B8 E1:  4.26901 (8 layers w. mamba, 8 per batch for training)
            E2:  3.98698
