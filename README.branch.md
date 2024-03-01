@@ -28,9 +28,12 @@ Now it improves steadily
 Mamba L8B8D: E1: 3.77266 (8 layers, with dynamic batches)
              E2: 3.47578
              E3: 3.36562 (Pythia 70m/Cerebras 111M have around 3.5xxx loss)
-             E4: 3.30104 (Cerebras-GPT-256M is 3.20763)
+             E4: 3.30104
              E5: 3.26393
              E6: 3.23828
+             E7: 3.21784
+             E8: 3.20951 (Cerebras-GPT-256M is 3.20763)
+             E9: 3.19427
 
 Mamba L8B8 E1:  4.26901 (8 layers w. mamba, 8 per batch for training)
            E2:  3.98698
